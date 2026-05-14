@@ -190,8 +190,19 @@ def run(args: argparse.Namespace) -> None:
         cap_indices = [None]
 
     out_caps = caps.shape[1] if args.caption_policy == "all" else 1
-    causal_json = np.empty((limit, out_caps), dtype=object)
-    causal_text = np.empty((limit, out_caps), dtype=object)
+    json_path = processed_root / f"{args.split}_causal_json.npy"
+    text_path = processed_root / f"{args.split}_causal_text.npy"
+    if args.resume and json_path.exists() and text_path.exists():
+        causal_json = np.load(json_path, allow_pickle=True)
+        causal_text = np.load(text_path, allow_pickle=True)
+        if causal_json.shape != (limit, out_caps) or causal_text.shape != (limit, out_caps):
+            raise ValueError(
+                f"Cannot resume with shape mismatch: json={causal_json.shape}, text={causal_text.shape}, "
+                f"expected={(limit, out_caps)}"
+            )
+    else:
+        causal_json = np.full((limit, out_caps), "", dtype=object)
+        causal_text = np.full((limit, out_caps), "", dtype=object)
     runner = None if args.mock else QwenVLRunner(args.qwen_path, args.device_map)
     failed_raw_path = processed_root / f"{args.split}_qwen_failed_raw.jsonl"
 
@@ -207,6 +218,8 @@ def run(args: argparse.Namespace) -> None:
         for out_idx, cap_idx in enumerate(selected_cap_indices):
             if cap_idx is None:
                 raise RuntimeError("Internal caption policy error")
+            if args.resume and str(causal_text[idx, out_idx]).strip():
+                continue
             caption = str(caps[idx, cap_idx])
             if args.mock:
                 obj = _mock_json(dataset, caption)
@@ -240,6 +253,27 @@ def run(args: argparse.Namespace) -> None:
                         causal_json[idx, out_idx] = json.dumps(obj, ensure_ascii=False)
                         causal_text[idx, out_idx] = fallback_condition
                         continue
+                    if args.fallback_to_caption:
+                        fallback = caption.strip()
+                        obj = {
+                            "dataset": "Weather" if dataset == "weather" else "Synth-M",
+                            "generation_condition": fallback,
+                            "parse_warning": f"caption_fallback: {type(exc).__name__}: {exc}",
+                        }
+                        _write_failed_raw(
+                            failed_raw_path,
+                            {
+                                "idx": idx,
+                                "caption_index": out_idx,
+                                "caption": caption,
+                                "raw": raw,
+                                "fallback": fallback,
+                                "error": f"{type(exc).__name__}: {exc}",
+                            },
+                        )
+                        causal_json[idx, out_idx] = json.dumps(obj, ensure_ascii=False)
+                        causal_text[idx, out_idx] = fallback
+                        continue
                     _write_failed_raw(
                         failed_raw_path,
                         {
@@ -257,9 +291,12 @@ def run(args: argparse.Namespace) -> None:
                     ) from exc
                 causal_json[idx, out_idx] = json.dumps(obj, ensure_ascii=False)
                 causal_text[idx, out_idx] = _generation_condition(obj, caption)
+            if args.save_every_batches > 0 and ((start // args.batch_size) + 1) % args.save_every_batches == 0:
+                np.save(json_path, causal_json)
+                np.save(text_path, causal_text)
 
-    np.save(processed_root / f"{args.split}_causal_json.npy", causal_json)
-    np.save(processed_root / f"{args.split}_causal_text.npy", causal_text)
+    np.save(json_path, causal_json)
+    np.save(text_path, causal_text)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -277,6 +314,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--caption-policy", choices=["first", "all", "random"], default="first")
     parser.add_argument("--caption-seed", type=int, default=42)
     parser.add_argument("--allow-partial-json", action="store_true")
+    parser.add_argument("--fallback-to-caption", action="store_true")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--save-every-batches", type=int, default=20)
     parser.add_argument("--compact", action="store_true")
     parser.add_argument("--render-charts", action="store_true", default=True)
     parser.add_argument("--mock", action="store_true")
