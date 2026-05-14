@@ -90,6 +90,44 @@ class QwenVLRunner:
         ]
         return self.processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
 
+    def generate_batch(self, prompts: list[str], image_paths: list[Path], max_new_tokens: int = 256) -> list[str]:
+        from qwen_vl_utils import process_vision_info
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": str(image_path)},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+            for prompt, image_path in zip(prompts, image_paths, strict=True)
+        ]
+        texts = [
+            self.processor.apply_chat_template([message], tokenize=False, add_generation_prompt=True)
+            for message in messages
+        ]
+        image_inputs, video_inputs = process_vision_info(messages)
+        inputs = self.processor(
+            text=texts,
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        ).to(self.model.device)
+        generated_ids = self.model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            temperature=None,
+            top_p=None,
+            top_k=None,
+        )
+        trimmed = [
+            out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids, strict=True)
+        ]
+        return self.processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+
 
 def run(args: argparse.Namespace) -> None:
     dataset = normalize_dataset_name(args.dataset)
@@ -104,25 +142,51 @@ def run(args: argparse.Namespace) -> None:
     limit = min(args.limit or ts.shape[0], ts.shape[0])
     template = load_prompt_template(dataset, args.prompts)
 
-    causal_json = np.empty((limit, caps.shape[1]), dtype=object)
-    causal_text = np.empty((limit, caps.shape[1]), dtype=object)
+    if args.caption_policy == "all":
+        cap_indices = list(range(caps.shape[1]))
+    elif args.caption_policy == "first":
+        cap_indices = [0]
+    else:
+        rng = np.random.default_rng(args.caption_seed)
+        cap_indices = [None]
+
+    out_caps = caps.shape[1] if args.caption_policy == "all" else 1
+    causal_json = np.empty((limit, out_caps), dtype=object)
+    causal_text = np.empty((limit, out_caps), dtype=object)
     runner = None if args.mock else QwenVLRunner(args.qwen_path, args.device_map)
 
-    for idx in tqdm(range(limit), desc=f"{dataset}:{args.split}:qwen"):
+    pending: list[tuple[int, int, str, Path, str]] = []
+    for idx in tqdm(range(limit), desc=f"{dataset}:{args.split}:prepare"):
         image_path = chart_dir / f"{idx}.png"
         if args.render_charts or not image_path.exists():
             render_line_chart(ts[idx], image_path, title=f"{dataset} {args.split} #{idx}")
         stats_text = json.dumps(chart_stats(ts[idx]), ensure_ascii=False)
-        for cap_idx in range(caps.shape[1]):
+        selected_cap_indices = cap_indices
+        if args.caption_policy == "random":
+            selected_cap_indices = [int(rng.integers(0, caps.shape[1]))]
+        for out_idx, cap_idx in enumerate(selected_cap_indices):
+            if cap_idx is None:
+                raise RuntimeError("Internal caption policy error")
             caption = str(caps[idx, cap_idx])
             if args.mock:
                 obj = _mock_json(dataset, caption)
+                causal_json[idx, out_idx] = json.dumps(obj, ensure_ascii=False)
+                causal_text[idx, out_idx] = _generation_condition(obj, caption)
             else:
                 prompt = fill_prompt(template, caption, stats_text)
-                raw = runner.generate(prompt, image_path, args.max_new_tokens)
+                pending.append((idx, out_idx, prompt, image_path, caption))
+
+    if not args.mock:
+        for start in tqdm(range(0, len(pending), args.batch_size), desc=f"{dataset}:{args.split}:qwen"):
+            batch = pending[start : start + args.batch_size]
+            prompts = [item[2] for item in batch]
+            image_paths = [item[3] for item in batch]
+            captions = [item[4] for item in batch]
+            raws = runner.generate_batch(prompts, image_paths, args.max_new_tokens)
+            for (idx, out_idx, _, _, _), caption, raw in zip(batch, captions, raws, strict=True):
                 obj = _json_from_text(raw)
-            causal_json[idx, cap_idx] = json.dumps(obj, ensure_ascii=False)
-            causal_text[idx, cap_idx] = _generation_condition(obj, caption)
+                causal_json[idx, out_idx] = json.dumps(obj, ensure_ascii=False)
+                causal_text[idx, out_idx] = _generation_condition(obj, caption)
 
     np.save(processed_root / f"{args.split}_causal_json.npy", causal_json)
     np.save(processed_root / f"{args.split}_causal_text.npy", causal_text)
@@ -138,7 +202,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--qwen-path", default="pretrained/Qwen2.5-VL-7B-Instruct")
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--max-new-tokens", type=int, default=192)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--caption-policy", choices=["first", "all", "random"], default="first")
+    parser.add_argument("--caption-seed", type=int, default=42)
     parser.add_argument("--render-charts", action="store_true", default=True)
     parser.add_argument("--mock", action="store_true")
     return parser

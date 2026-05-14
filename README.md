@@ -44,10 +44,14 @@ python -m cmtsg.prepare_data --dataset weather --source "C:\Users\蜂窝煤\Desk
 Render line charts and extract causal text with Qwen2.5-VL:
 
 ```powershell
-python -m cmtsg.preprocess.qwen_causal_text --dataset weather --split train
-python -m cmtsg.preprocess.qwen_causal_text --dataset weather --split valid
-python -m cmtsg.preprocess.qwen_causal_text --dataset weather --split test
+python -m cmtsg.preprocess.qwen_causal_text --dataset weather --split train --caption-policy first --batch-size 4
+python -m cmtsg.preprocess.qwen_causal_text --dataset weather --split valid --caption-policy first --batch-size 4
+python -m cmtsg.preprocess.qwen_causal_text --dataset weather --split test --caption-policy first --batch-size 4
 ```
+
+`--caption-policy first` is the default practical preprocessing mode. Use
+`--caption-policy all` only when you explicitly want all VerbalTS captions,
+because Weather has three captions per sample and this triples Qwen inference.
 
 For a dry smoke run without loading Qwen:
 
