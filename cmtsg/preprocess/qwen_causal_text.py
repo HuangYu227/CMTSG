@@ -32,6 +32,12 @@ def _json_from_text(text: str) -> dict[str, Any]:
         raise
 
 
+def _write_failed_raw(path: Path, row: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
 def _generation_condition(obj: dict[str, Any], fallback: str) -> str:
     value = obj.get("generation_condition")
     if isinstance(value, str) and value.strip():
@@ -56,6 +62,8 @@ class QwenVLRunner:
 
         self.model_path = str(resolve_path(model_path))
         self.processor = AutoProcessor.from_pretrained(self.model_path, local_files_only=True)
+        if hasattr(self.processor, "tokenizer"):
+            self.processor.tokenizer.padding_side = "left"
         self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             self.model_path,
             torch_dtype="auto",
@@ -154,6 +162,7 @@ def run(args: argparse.Namespace) -> None:
     causal_json = np.empty((limit, out_caps), dtype=object)
     causal_text = np.empty((limit, out_caps), dtype=object)
     runner = None if args.mock else QwenVLRunner(args.qwen_path, args.device_map)
+    failed_raw_path = processed_root / f"{args.split}_qwen_failed_raw.jsonl"
 
     pending: list[tuple[int, int, str, Path, str]] = []
     for idx in tqdm(range(limit), desc=f"{dataset}:{args.split}:prepare"):
@@ -184,7 +193,24 @@ def run(args: argparse.Namespace) -> None:
             captions = [item[4] for item in batch]
             raws = runner.generate_batch(prompts, image_paths, args.max_new_tokens)
             for (idx, out_idx, _, _, _), caption, raw in zip(batch, captions, raws, strict=True):
-                obj = _json_from_text(raw)
+                try:
+                    obj = _json_from_text(raw)
+                except Exception as exc:
+                    _write_failed_raw(
+                        failed_raw_path,
+                        {
+                            "idx": idx,
+                            "caption_index": out_idx,
+                            "caption": caption,
+                            "raw": raw,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        },
+                    )
+                    preview = raw[:500].replace("\n", "\\n")
+                    raise ValueError(
+                        f"Qwen output is not valid JSON for idx={idx}, caption_index={out_idx}. "
+                        f"Raw output was saved to {failed_raw_path}. Preview: {preview!r}"
+                    ) from exc
                 causal_json[idx, out_idx] = json.dumps(obj, ensure_ascii=False)
                 causal_text[idx, out_idx] = _generation_condition(obj, caption)
 
