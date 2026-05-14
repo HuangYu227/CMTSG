@@ -1,0 +1,8 @@
+numpy>=1.24
+torch>=2.1
+transformers>=4.47
+qwen-vl-utils>=0.0.8
+Pillow>=10.0
+matplotlib>=3.7
+PyYAML>=6.0
+tqdm>=4.66
