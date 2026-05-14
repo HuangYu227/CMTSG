@@ -22,6 +22,10 @@ model:
   mlp_ratio: 4.0
   patch_size: 1
   dropout: 0.1
+  use_text_condition: true
+  use_env_condition: true
+  env_source: gaf
+  routing: text
 
 training:
   batch_size: 128
@@ -39,3 +43,10 @@ evaluation:
   require_cttp: true
   verbalts_root: ../VerbalTS
   cttp_root: pretrained/Weather_cttp
+  best_metrics:
+    - name: fid_cttp
+      mode: min
+    - name: jftsd_cttp
+      mode: min
+    - name: cttp
+      mode: max

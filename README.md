@@ -102,6 +102,16 @@ jftsd_cttp
 Use `evaluation.require_cttp: false` only for debugging infrastructure without
 semantic metrics.
 
+Weather ablation configs:
+
+```text
+configs/weather.yaml                         # full CMTSG: text + GAF env + text routing
+configs/ablations/weather_no_env.yaml        # removes environment conditioning
+configs/ablations/weather_no_text.yaml       # removes text conditioning, routes env by learned query
+configs/ablations/weather_learned_env.yaml   # replaces GAF environments with learned random env bank
+configs/ablations/weather_uniform_route.yaml # replaces text routing with uniform env mixture
+```
+
 Optional CTTP links on the server:
 
 ```bash

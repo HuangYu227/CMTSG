@@ -40,6 +40,11 @@ def _make_model(cfg: dict, seq_len: int, n_vars: int, gaf_size: int) -> Gaussian
         mlp_ratio=float(model_cfg.get("mlp_ratio", 4.0)),
         patch_size=int(model_cfg.get("patch_size", 1)),
         dropout=float(model_cfg.get("dropout", 0.0)),
+        n_env=int(cfg.get("n_env", 12)),
+        use_text_condition=bool(model_cfg.get("use_text_condition", True)),
+        use_env_condition=bool(model_cfg.get("use_env_condition", True)),
+        env_source=str(model_cfg.get("env_source", "gaf")),
+        routing=str(model_cfg.get("routing", "text")),
     )
     diff_cfg = cfg.get("diffusion", {})
     return GaussianDiffusion(
@@ -63,6 +68,24 @@ def _save_checkpoint(path: Path, diffusion: GaussianDiffusion, optimizer: torch.
         },
         path,
     )
+
+
+def _default_best_metric_specs() -> list[dict[str, str]]:
+    return [
+        {"name": "fid_cttp", "mode": "min"},
+        {"name": "jftsd_cttp", "mode": "min"},
+        {"name": "cttp", "mode": "max"},
+    ]
+
+
+def _is_better(value: float, best: float | None, mode: str) -> bool:
+    if best is None:
+        return True
+    if mode == "min":
+        return value < best
+    if mode == "max":
+        return value > best
+    raise ValueError(f"Unsupported best metric mode: {mode}")
 
 
 def train(args: argparse.Namespace) -> None:
@@ -121,12 +144,20 @@ def train(args: argparse.Namespace) -> None:
         "n_vars": n_vars,
         "gaf_size": gaf_size,
         "anchor_indices": anchor_indices.tolist(),
+        "model_ablation": {
+            "use_text_condition": bool(cfg.get("model", {}).get("use_text_condition", True)),
+            "use_env_condition": bool(cfg.get("model", {}).get("use_env_condition", True)),
+            "env_source": str(cfg.get("model", {}).get("env_source", "gaf")),
+            "routing": str(cfg.get("model", {}).get("routing", "text")),
+        },
     }
     save_json(stats, output_root / "train_stats.json")
     log_dir = ensure_dir(output_root / "logs")
     eval_cfg = cfg.get("evaluation", {})
     sample_every = int(args.sample_every if args.sample_every is not None else eval_cfg.get("sample_every", 0))
     sample_count = int(args.sample_count or eval_cfg.get("sample_count", 128))
+    best_metric_specs = eval_cfg.get("best_metrics") or _default_best_metric_specs()
+    best_sample_metrics: dict[str, float] = {}
 
     for epoch in range(1, epochs + 1):
         epoch_start = time.time()
@@ -197,6 +228,31 @@ def train(args: argparse.Namespace) -> None:
                 tag=f"epoch_{epoch:04d}",
             )
             row.update({f"sample_{key}": value for key, value in sample_metrics.items() if isinstance(value, (int, float))})
+            for spec in best_metric_specs:
+                metric_name = str(spec["name"])
+                metric_mode = str(spec.get("mode", "min"))
+                metric_value = sample_metrics.get(metric_name)
+                if not isinstance(metric_value, (int, float)):
+                    continue
+                previous_best = best_sample_metrics.get(metric_name)
+                if _is_better(float(metric_value), previous_best, metric_mode):
+                    best_sample_metrics[metric_name] = float(metric_value)
+                    metric_stats = {
+                        **stats,
+                        "best_metric_name": metric_name,
+                        "best_metric_mode": metric_mode,
+                        "best_metric_value": float(metric_value),
+                        "best_metric_epoch": epoch,
+                    }
+                    _save_checkpoint(
+                        output_root / "checkpoints" / f"best_{metric_name}.pt",
+                        diffusion,
+                        optimizer,
+                        epoch,
+                        cfg,
+                        metric_stats,
+                    )
+                    save_json(best_sample_metrics, output_root / "checkpoints" / "best_sample_metrics.json")
 
         append_csv(log_dir / "epoch_metrics.csv", row)
         append_jsonl(log_dir / "epoch_metrics.jsonl", row)

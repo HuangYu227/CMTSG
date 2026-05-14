@@ -1,7 +1,7 @@
-dataset: synth-m
-data_root: datasets/synth-m
-processed_root: processed/synth-m
-output_root: runs/synth-m
+dataset: weather
+data_root: datasets/weather
+processed_root: processed/weather
+output_root: runs/weather_learned_env
 
 seed: 42
 n_env: 12
@@ -20,11 +20,11 @@ model:
   depth: 4
   num_heads: 4
   mlp_ratio: 4.0
-  patch_size: 4
+  patch_size: 1
   dropout: 0.1
   use_text_condition: true
   use_env_condition: true
-  env_source: gaf
+  env_source: learned
   routing: text
 
 training:
@@ -42,11 +42,4 @@ evaluation:
   cttp_batch_size: 128
   require_cttp: true
   verbalts_root: ../VerbalTS
-  cttp_root: pretrained/synth-m_cttp
-  best_metrics:
-    - name: fid_cttp
-      mode: min
-    - name: jftsd_cttp
-      mode: min
-    - name: cttp
-      mode: max
+  cttp_root: pretrained/Weather_cttp
