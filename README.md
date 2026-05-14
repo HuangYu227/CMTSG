@@ -74,6 +74,48 @@ python -m cmtsg.train --config configs/synth_m.yaml --epochs 10
 Training reads only cached `processed/{dataset}/{split}_text_emb.npy`; Qwen and
 LongCLIP are not loaded by the training loop.
 
+Training writes trend logs to:
+
+```text
+runs/{dataset}/logs/epoch_metrics.csv
+runs/{dataset}/logs/epoch_metrics.jsonl
+runs/{dataset}/logs/sample_metrics.jsonl
+```
+
+Per-epoch logs include train/validation diffusion loss and routing statistics.
+Every `evaluation.sample_every` epochs, validation samples are generated and
+scored with `MDD`, `flat_kl`, `MMD-RBF`, `fid_raw_proxy`, and
+`jftsd_text_proxy`. These two proxy metrics are not VerbalTS metrics; they are
+only lightweight diagnostics.
+
+With the default configs, CTTP metrics are required. If `Weather_cttp` or
+`synth-m_cttp` is missing or malformed, evaluation raises immediately and writes
+`metrics_failed.json`. When CTTP is available, the sampler reports the VerbalTS
+style metrics:
+
+```text
+cttp
+fid_cttp
+jftsd_cttp
+```
+
+Use `evaluation.require_cttp: false` only for debugging infrastructure without
+semantic metrics.
+
+Optional CTTP links on the server:
+
+```bash
+ln -sfn /home/newuser001/huangyu/Research/VerbalTS/save/Weather_cttp pretrained/Weather_cttp
+ln -sfn /home/newuser001/huangyu/Research/VerbalTS/save/synth-m_cttp pretrained/synth-m_cttp
+```
+
+Validate CTTP before a long run:
+
+```bash
+python -m cmtsg.validate_cttp --verbalts-root ../VerbalTS --cttp-root pretrained/Weather_cttp
+python -m cmtsg.validate_cttp --verbalts-root ../VerbalTS --cttp-root pretrained/synth-m_cttp
+```
+
 ## Quick Checks
 
 ```powershell

@@ -31,3 +31,11 @@ training:
   grad_clip: 1.0
   num_workers: 0
   save_every: 10
+
+evaluation:
+  sample_every: 10
+  sample_count: 128
+  cttp_batch_size: 128
+  require_cttp: true
+  verbalts_root: ../VerbalTS
+  cttp_root: pretrained/synth-m_cttp

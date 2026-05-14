@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
 
 import numpy as np
@@ -11,9 +12,11 @@ from cmtsg.config import get_nested, load_config
 from cmtsg.data import load_ts
 from cmtsg.dataset import CMTSGDataset
 from cmtsg.env_bank import build_anchor_gaf
-from cmtsg.metrics import flat_kl, mdd, mmd_rbf
+from cmtsg.logging_utils import append_csv, append_jsonl
+from cmtsg.metrics import fid_raw, flat_kl, jftsd_text_proxy, mdd, mmd_rbf
 from cmtsg.models import CMTSGModel
 from cmtsg.models.diffusion import GaussianDiffusion
+from cmtsg.semantic_metrics import compute_cttp_metrics
 from cmtsg.utils import ensure_dir, resolve_path, save_json, set_seed
 
 
@@ -120,10 +123,17 @@ def train(args: argparse.Namespace) -> None:
         "anchor_indices": anchor_indices.tolist(),
     }
     save_json(stats, output_root / "train_stats.json")
+    log_dir = ensure_dir(output_root / "logs")
+    eval_cfg = cfg.get("evaluation", {})
+    sample_every = int(args.sample_every if args.sample_every is not None else eval_cfg.get("sample_every", 0))
+    sample_count = int(args.sample_count or eval_cfg.get("sample_count", 128))
 
     for epoch in range(1, epochs + 1):
+        epoch_start = time.time()
         diffusion.train()
         train_losses = []
+        train_route_entropy = []
+        train_route_max = []
         for batch in train_loader:
             x = batch["x"].to(device)
             text_emb = batch["text_emb"].to(device)
@@ -134,18 +144,38 @@ def train(args: argparse.Namespace) -> None:
                 torch.nn.utils.clip_grad_norm_(diffusion.parameters(), grad_clip)
             optimizer.step()
             train_losses.append(float(loss.detach().cpu()))
+            train_route_entropy.append(float(metrics["route_entropy"].detach().cpu()))
+            train_route_max.append(float(metrics["route_max"].detach().cpu()))
 
         diffusion.eval()
         val_losses = []
+        val_route_entropy = []
+        val_route_max = []
         with torch.no_grad():
             for batch in valid_loader:
                 x = batch["x"].to(device)
                 text_emb = batch["text_emb"].to(device)
-                loss, _ = diffusion.training_loss(x, text_emb, anchor_gaf)
+                loss, metrics = diffusion.training_loss(x, text_emb, anchor_gaf)
                 val_losses.append(float(loss.detach().cpu()))
+                val_route_entropy.append(float(metrics["route_entropy"].detach().cpu()))
+                val_route_max.append(float(metrics["route_max"].detach().cpu()))
         train_loss = float(np.mean(train_losses))
         val_loss = float(np.mean(val_losses))
-        print(f"epoch={epoch:04d} train_loss={train_loss:.6f} val_loss={val_loss:.6f}")
+        row = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "train_route_entropy": float(np.mean(train_route_entropy)),
+            "train_route_max": float(np.mean(train_route_max)),
+            "val_route_entropy": float(np.mean(val_route_entropy)),
+            "val_route_max": float(np.mean(val_route_max)),
+            "lr": float(optimizer.param_groups[0]["lr"]),
+            "epoch_seconds": float(time.time() - epoch_start),
+        }
+        print(
+            f"epoch={epoch:04d} train_loss={train_loss:.6f} val_loss={val_loss:.6f} "
+            f"route_max={row['val_route_max']:.4f}"
+        )
 
         _save_checkpoint(output_root / "checkpoints" / "last.pt", diffusion, optimizer, epoch, cfg, stats)
         if val_loss < best_val:
@@ -153,9 +183,37 @@ def train(args: argparse.Namespace) -> None:
             _save_checkpoint(output_root / "checkpoints" / "best.pt", diffusion, optimizer, epoch, cfg, stats)
         if epoch % int(get_nested(cfg, "training.save_every", 10)) == 0:
             _save_checkpoint(output_root / "checkpoints" / f"epoch_{epoch:04d}.pt", diffusion, optimizer, epoch, cfg, stats)
+        if sample_every > 0 and epoch % sample_every == 0:
+            sample_metrics = sample_and_score(
+                diffusion,
+                valid_ds,
+                anchor_gaf,
+                output_root,
+                device,
+                mean,
+                std,
+                sample_count,
+                cfg,
+                tag=f"epoch_{epoch:04d}",
+            )
+            row.update({f"sample_{key}": value for key, value in sample_metrics.items() if isinstance(value, (int, float))})
+
+        append_csv(log_dir / "epoch_metrics.csv", row)
+        append_jsonl(log_dir / "epoch_metrics.jsonl", row)
 
     if args.sample_after_train:
-        sample_and_score(diffusion, valid_ds, anchor_gaf, output_root, device, mean, std, args.sample_count)
+        sample_and_score(
+            diffusion,
+            valid_ds,
+            anchor_gaf,
+            output_root,
+            device,
+            mean,
+            std,
+            sample_count,
+            cfg,
+            tag="final",
+        )
 
 
 @torch.no_grad()
@@ -168,7 +226,9 @@ def sample_and_score(
     mean: np.ndarray,
     std: np.ndarray,
     sample_count: int,
-) -> None:
+    cfg: dict,
+    tag: str = "valid",
+) -> dict[str, float | str]:
     diffusion.eval()
     count = min(sample_count, len(dataset))
     batch = [dataset[i] for i in range(count)]
@@ -176,11 +236,51 @@ def sample_and_score(
     gen_norm = diffusion.sample((count, dataset.ts.shape[1], dataset.ts.shape[2]), text_emb, anchor_gaf)
     gen = gen_norm.cpu().numpy() * std + mean
     real = dataset.ts[:count]
-    sample_dir = ensure_dir(output_root / "samples")
+    text_np = text_emb.detach().cpu().numpy()
+    sample_dir = ensure_dir(output_root / "samples" / tag)
     np.save(sample_dir / "valid_samples.npy", gen.astype(np.float32))
-    scores = {"mdd": mdd(real, gen), "flat_kl": flat_kl(real, gen), "mmd_rbf": mmd_rbf(real, gen)}
+    scores: dict[str, float | str] = {
+        "mdd": mdd(real, gen),
+        "flat_kl": flat_kl(real, gen),
+        "mmd_rbf": mmd_rbf(real, gen),
+        "fid_raw_proxy": fid_raw(real, gen),
+        "jftsd_text_proxy": jftsd_text_proxy(real, gen, text_np),
+    }
+    eval_cfg = cfg.get("evaluation", {})
+    require_cttp = bool(eval_cfg.get("require_cttp", False))
+    cttp_root = eval_cfg.get("cttp_root")
+    verbalts_root = eval_cfg.get("verbalts_root")
+    if cttp_root and verbalts_root:
+        captions = [str(dataset.caps[i, 0]) for i in range(count)]
+        try:
+            cttp_scores = compute_cttp_metrics(
+                real,
+                gen,
+                captions,
+                verbalts_root=verbalts_root,
+                cttp_root=cttp_root,
+                device=str(device),
+                batch_size=int(eval_cfg.get("cttp_batch_size", 128)),
+            )
+            scores.update(cttp_scores)
+            scores["cttp_status"] = "ok"
+        except Exception as exc:
+            scores["cttp_status"] = f"failed: {type(exc).__name__}: {exc}"
+            if require_cttp:
+                save_json(scores, sample_dir / "metrics_failed.json")
+                raise RuntimeError(
+                    "CTTP metrics are required but failed. "
+                    f"Set evaluation.require_cttp=false only for debugging. Cause: {type(exc).__name__}: {exc}"
+                ) from exc
+    else:
+        scores["cttp_status"] = "missing_config: set evaluation.verbalts_root and evaluation.cttp_root"
+        if require_cttp:
+            save_json(scores, sample_dir / "metrics_failed.json")
+            raise RuntimeError("CTTP metrics are required but evaluation.verbalts_root/evaluation.cttp_root is missing.")
     save_json(scores, sample_dir / "metrics.json")
+    append_jsonl(output_root / "logs" / "sample_metrics.jsonl", {"tag": tag, **scores})
     print(f"sample_metrics={scores}")
+    return scores
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -195,6 +295,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--sample-after-train", action="store_true")
     parser.add_argument("--sample-count", type=int, default=16)
+    parser.add_argument("--sample-every", type=int, default=None)
     return parser
 
 
