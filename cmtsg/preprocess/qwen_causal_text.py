@@ -16,12 +16,19 @@ except Exception:  # pragma: no cover
 from cmtsg.charts import render_line_chart
 from cmtsg.data import load_text_caps, load_ts, split_paths
 from cmtsg.imaging import chart_stats
-from cmtsg.prompts import fill_prompt, load_prompt_template
+from cmtsg.prompts import compact_generation_condition_prompt, fill_prompt, load_prompt_template
 from cmtsg.utils import ensure_dir, normalize_dataset_name, resolve_path
 
 
 def _json_from_text(text: str) -> dict[str, Any]:
     text = text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
     try:
         return json.loads(text)
     except json.JSONDecodeError:
@@ -54,6 +61,30 @@ def _mock_json(dataset: str, caption: str) -> dict[str, Any]:
         "chart_consistency": {"is_consistent_with_text": "unclear", "evidence": "mock output"},
         "generation_condition": sentence + ".",
     }
+
+
+def _generation_condition_from_raw(raw: str) -> str | None:
+    marker = '"generation_condition"'
+    pos = raw.find(marker)
+    if pos < 0:
+        return None
+    colon = raw.find(":", pos + len(marker))
+    if colon < 0:
+        return None
+    first_quote = raw.find('"', colon + 1)
+    if first_quote < 0:
+        return None
+    end = first_quote + 1
+    escaped = False
+    while end < len(raw):
+        ch = raw[end]
+        if ch == '"' and not escaped:
+            return raw[first_quote + 1 : end].strip()
+        escaped = ch == "\\" and not escaped
+        if ch != "\\":
+            escaped = False
+        end += 1
+    return None
 
 
 class QwenVLRunner:
@@ -182,7 +213,10 @@ def run(args: argparse.Namespace) -> None:
                 causal_json[idx, out_idx] = json.dumps(obj, ensure_ascii=False)
                 causal_text[idx, out_idx] = _generation_condition(obj, caption)
             else:
-                prompt = fill_prompt(template, caption, stats_text)
+                if args.compact:
+                    prompt = compact_generation_condition_prompt(dataset, caption, stats_text)
+                else:
+                    prompt = fill_prompt(template, caption, stats_text)
                 pending.append((idx, out_idx, prompt, image_path, caption))
 
     if not args.mock:
@@ -196,6 +230,16 @@ def run(args: argparse.Namespace) -> None:
                 try:
                     obj = _json_from_text(raw)
                 except Exception as exc:
+                    fallback_condition = _generation_condition_from_raw(raw)
+                    if args.allow_partial_json and fallback_condition:
+                        obj = {
+                            "dataset": "Weather" if dataset == "weather" else "Synth-M",
+                            "generation_condition": fallback_condition,
+                            "parse_warning": f"partial_json_fallback: {type(exc).__name__}: {exc}",
+                        }
+                        causal_json[idx, out_idx] = json.dumps(obj, ensure_ascii=False)
+                        causal_text[idx, out_idx] = fallback_condition
+                        continue
                     _write_failed_raw(
                         failed_raw_path,
                         {
@@ -228,10 +272,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--qwen-path", default="pretrained/Qwen2.5-VL-7B-Instruct")
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--max-new-tokens", type=int, default=192)
+    parser.add_argument("--max-new-tokens", type=int, default=384)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--caption-policy", choices=["first", "all", "random"], default="first")
     parser.add_argument("--caption-seed", type=int, default=42)
+    parser.add_argument("--allow-partial-json", action="store_true")
+    parser.add_argument("--compact", action="store_true")
     parser.add_argument("--render-charts", action="store_true", default=True)
     parser.add_argument("--mock", action="store_true")
     return parser

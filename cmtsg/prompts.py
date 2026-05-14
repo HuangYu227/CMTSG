@@ -31,3 +31,27 @@ def load_prompt_template(dataset: str, path: str | Path | None = None) -> str:
 
 def fill_prompt(template: str, text_info: str, chart_stats: str = "") -> str:
     return template.replace("{text_info}", text_info).replace("{chart_stats}", chart_stats)
+
+
+def compact_generation_condition_prompt(dataset: str, text_info: str, chart_stats: str = "") -> str:
+    dataset = normalize_dataset_name(dataset)
+    if dataset == "weather":
+        return (
+            "You are a meteorological causal reasoning expert for text-to-time-series generation.\n"
+            "Use the forecast text as the primary source and the chart only as support.\n"
+            "Return valid JSON only, with exactly one key: generation_condition.\n"
+            "The value must be one concise English sentence describing the weather-driven causal "
+            "conditions for generating the multivariate time series.\n\n"
+            f"[Original Weather Text Description]\n{text_info}\n\n"
+            f"[Optional Chart Statistics]\n{chart_stats}\n\n"
+            'Return format: {"generation_condition": "..."}'
+        )
+    return (
+        "You are a causal mechanism extractor for synthetic multivariate time-series generation.\n"
+        "Use the text as the primary source and the chart only as visual verification.\n"
+        "Return valid JSON only, with exactly one key: generation_condition.\n"
+        "The value must be one concise English sentence describing the causal generation mechanism.\n\n"
+        f"[Original Text Description]\n{text_info}\n\n"
+        f"[Optional Chart Statistics]\n{chart_stats}\n\n"
+        'Return format: {"generation_condition": "..."}'
+    )
