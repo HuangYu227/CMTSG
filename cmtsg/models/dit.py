@@ -7,7 +7,10 @@ from torch import nn
 
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    return x * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+    while shift.ndim < x.ndim:
+        shift = shift.unsqueeze(1)
+        scale = scale.unsqueeze(1)
+    return x * (1.0 + scale) + shift
 
 
 class TimestepEmbedder(nn.Module):
@@ -40,7 +43,7 @@ class PatchEmbed1D(nn.Module):
         super().__init__()
         self.n_vars = n_vars
         self.patch_size = patch_size
-        self.proj = nn.Linear(n_vars * patch_size, hidden_size)
+        self.proj = nn.Linear(patch_size, hidden_size)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, int]:
         bsz, length, n_vars = x.shape
@@ -49,16 +52,21 @@ class PatchEmbed1D(nn.Module):
         pad_len = (self.patch_size - length % self.patch_size) % self.patch_size
         if pad_len:
             x = torch.cat([x, torch.zeros(bsz, pad_len, n_vars, device=x.device, dtype=x.dtype)], dim=1)
-        patches = x.reshape(bsz, x.shape[1] // self.patch_size, self.patch_size * n_vars)
+        patches = x.reshape(bsz, x.shape[1] // self.patch_size, self.patch_size, n_vars)
+        patches = patches.permute(0, 3, 1, 2).contiguous()
         return self.proj(patches), pad_len
 
 
-class DiTBlock(nn.Module):
+class FactorizedDiTBlock(nn.Module):
     def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float = 4.0, dropout: float = 0.0) -> None:
         super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = nn.MultiheadAttention(hidden_size, num_heads, dropout=dropout, batch_first=True)
-        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm_temporal = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.temporal_attn = nn.MultiheadAttention(hidden_size, num_heads, dropout=dropout, batch_first=True)
+        self.norm_variable = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.variable_attn = nn.MultiheadAttention(hidden_size, num_heads, dropout=dropout, batch_first=True)
+        self.norm_cross = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.cross_attn = nn.MultiheadAttention(hidden_size, num_heads, dropout=dropout, batch_first=True)
+        self.norm_mlp = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden = int(hidden_size * mlp_ratio)
         self.mlp = nn.Sequential(
             nn.Linear(hidden_size, mlp_hidden),
@@ -66,17 +74,44 @@ class DiTBlock(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(mlp_hidden, hidden_size),
         )
-        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size))
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 12 * hidden_size))
         nn.init.zeros_(self.adaLN_modulation[-1].weight)
         nn.init.zeros_(self.adaLN_modulation[-1].bias)
 
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(cond).chunk(6, dim=1)
-        attn_in = modulate(self.norm1(x), shift_msa, scale_msa)
-        attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
-        x = x + gate_msa.unsqueeze(1) * attn_out
-        mlp_in = modulate(self.norm2(x), shift_mlp, scale_mlp)
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(mlp_in)
+    def forward(self, x: torch.Tensor, cond: torch.Tensor, env_context: torch.Tensor) -> torch.Tensor:
+        (
+            shift_t,
+            scale_t,
+            gate_t,
+            shift_v,
+            scale_v,
+            gate_v,
+            shift_c,
+            scale_c,
+            gate_c,
+            shift_mlp,
+            scale_mlp,
+            gate_mlp,
+        ) = self.adaLN_modulation(cond).chunk(12, dim=1)
+        bsz, n_vars, n_tokens, hidden = x.shape
+
+        temporal_in = modulate(self.norm_temporal(x), shift_t, scale_t).reshape(bsz * n_vars, n_tokens, hidden)
+        temporal_out, _ = self.temporal_attn(temporal_in, temporal_in, temporal_in, need_weights=False)
+        temporal_out = temporal_out.reshape(bsz, n_vars, n_tokens, hidden)
+        x = x + gate_t[:, None, None, :] * temporal_out
+
+        variable_in = modulate(self.norm_variable(x), shift_v, scale_v).permute(0, 2, 1, 3).reshape(bsz * n_tokens, n_vars, hidden)
+        variable_out, _ = self.variable_attn(variable_in, variable_in, variable_in, need_weights=False)
+        variable_out = variable_out.reshape(bsz, n_tokens, n_vars, hidden).permute(0, 2, 1, 3)
+        x = x + gate_v[:, None, None, :] * variable_out
+
+        cross_in = modulate(self.norm_cross(x), shift_c, scale_c).reshape(bsz, n_vars * n_tokens, hidden)
+        cross_out, _ = self.cross_attn(cross_in, env_context, env_context, need_weights=False)
+        cross_out = cross_out.reshape(bsz, n_vars, n_tokens, hidden)
+        x = x + gate_c[:, None, None, :] * cross_out
+
+        mlp_in = modulate(self.norm_mlp(x), shift_mlp, scale_mlp)
+        x = x + gate_mlp[:, None, None, :] * self.mlp(mlp_in)
         return x
 
 
@@ -121,24 +156,37 @@ class TimeSeriesDiT(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size),
         )
+        self.env_token_proj = nn.Linear(env_dim, hidden_size)
         max_tokens = math.ceil(seq_len / patch_size)
-        self.pos_embed = nn.Parameter(torch.zeros(1, max_tokens, hidden_size))
+        self.time_pos_embed = nn.Parameter(torch.zeros(1, 1, max_tokens, hidden_size))
+        self.var_pos_embed = nn.Parameter(torch.zeros(1, n_vars, 1, hidden_size))
         self.blocks = nn.ModuleList(
-            [DiTBlock(hidden_size, num_heads, mlp_ratio, dropout) for _ in range(depth)]
+            [FactorizedDiTBlock(hidden_size, num_heads, mlp_ratio, dropout) for _ in range(depth)]
         )
-        self.final_layer = FinalLayer(hidden_size, patch_size * n_vars)
-        nn.init.normal_(self.pos_embed, std=0.02)
+        self.final_layer = FinalLayer(hidden_size, patch_size)
+        nn.init.normal_(self.time_pos_embed, std=0.02)
+        nn.init.normal_(self.var_pos_embed, std=0.02)
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor, text_emb: torch.Tensor, env_mix: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        text_emb: torch.Tensor,
+        env_mix: torch.Tensor,
+        env_tokens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         tokens, pad_len = self.x_embedder(x)
-        tokens = tokens + self.pos_embed[:, : tokens.shape[1]]
+        tokens = tokens + self.time_pos_embed[:, :, : tokens.shape[2]] + self.var_pos_embed
         prod_dim = min(text_emb.shape[-1], env_mix.shape[-1])
         cond_in = torch.cat([text_emb, env_mix, text_emb[:, :prod_dim] * env_mix[:, :prod_dim]], dim=-1)
         cond = self.t_embedder(t) + self.condition_mlp(cond_in)
+        if env_tokens is None:
+            env_tokens = env_mix[:, None, :]
+        env_context = self.env_token_proj(env_tokens)
         for block in self.blocks:
-            tokens = block(tokens, cond)
+            tokens = block(tokens, cond, env_context)
         patches = self.final_layer(tokens, cond)
-        out = patches.reshape(x.shape[0], -1, self.patch_size, self.n_vars).reshape(x.shape[0], -1, self.n_vars)
+        out = patches.permute(0, 2, 3, 1).contiguous().reshape(x.shape[0], -1, self.n_vars)
         if pad_len:
             out = out[:, :-pad_len]
         return out[:, : self.seq_len]

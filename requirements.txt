@@ -6,3 +6,6 @@ Pillow>=10.0
 matplotlib>=3.7
 PyYAML>=6.0
 tqdm>=4.66
+einops>=0.8.1
+x-transformers>=1.31.9
+hyper-connections>=0.4.6

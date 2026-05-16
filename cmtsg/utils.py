@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-
+"""
+normalize_dataset_name鲁棒性不够,只能支持特定的几个文件名
+"""
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 

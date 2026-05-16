@@ -6,14 +6,19 @@ output_root: runs/weather_no_env
 seed: 42
 n_env: 12
 env_seed: 42
-gaf_max_size: 64
+gaf_max_size: 384
 text_emb_dim: 64
 
 diffusion:
-  num_steps: 50
+  num_steps: 100
   beta_start: 0.0001
-  beta_end: 0.5
+  beta_end: 0.02
   schedule: quad
+  lambda_spectral: 0.05
+  spectral_warmup_power: 1.0
+  spectral_mode: abs
+  spectral_high_freq_gamma: 1.0
+  spectral_dc_weight: 0.05
 
 model:
   hidden_size: 128
@@ -22,10 +27,25 @@ model:
   mlp_ratio: 4.0
   patch_size: 1
   dropout: 0.1
+  n_env: 12
+  env_dim: 64
+  env_slot_mode: dynamic_gaf
   use_text_condition: true
   use_env_condition: false
   env_source: gaf
   routing: text
+  env_hidden_channels: 64
+  env_num_blocks: 4
+  env_kernel_size: 7
+  env_expansion: 4
+  env_pool_size: 4
+  slot_diversity_weight: 0.01
+  route_entropy_weight: 0.001
+  route_entropy_warmup_epochs: 10
+  text_slot_align_weight: 0.01
+  text_env_slot_weight: 0.02
+  text_drop_prob: 0.0
+  env_drop_prob: 0.0
 
 training:
   batch_size: 128
@@ -39,6 +59,7 @@ training:
 evaluation:
   sample_every: 10
   sample_count: 128
+  use_gaf_condition: true
   cttp_batch_size: 128
   require_cttp: true
   verbalts_root: ../VerbalTS

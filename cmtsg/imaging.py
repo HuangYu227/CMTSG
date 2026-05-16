@@ -7,7 +7,6 @@ import numpy as np
 
 GafKind = Literal["GASF", "GADF"]
 
-
 def paa_1d(series: np.ndarray, output_size: int) -> np.ndarray:
     values = np.asarray(series, dtype=np.float32)
     if values.ndim != 1:
@@ -47,14 +46,15 @@ def gramian_angular_field(series: np.ndarray, kind: GafKind = "GASF") -> np.ndar
     sin_values = np.sqrt(np.clip(1.0 - cos_values**2, 0.0, 1.0))
     if kind == "GASF":
         gaf = np.outer(cos_values, cos_values) - np.outer(sin_values, sin_values)
+        return ((gaf + 1.0) * 0.5).astype(np.float32)
     elif kind == "GADF":
         gaf = np.outer(sin_values, cos_values) - np.outer(cos_values, sin_values)
+        return np.abs(gaf).astype(np.float32)
     else:
         raise ValueError(f"Unknown GAF kind: {kind}")
-    return ((gaf + 1.0) * 0.5).astype(np.float32)
 
 
-def gasf_multivariate(sample: np.ndarray, max_size: int = 64) -> np.ndarray:
+def gasf_multivariate(sample: np.ndarray, max_size: int = 384) -> np.ndarray:
     values = np.asarray(sample, dtype=np.float32)
     if values.ndim == 1:
         values = values[:, None]
@@ -67,7 +67,7 @@ def gasf_multivariate(sample: np.ndarray, max_size: int = 64) -> np.ndarray:
         series = minmax_scale_1d(values[:, var_idx])
         if length > size:
             series = paa_1d(series, size)
-        images.append(gramian_angular_field(series, "GASF"))
+        images.append(gramian_angular_field(series, "GADF"))
     return np.stack(images, axis=0).astype(np.float32)
 
 

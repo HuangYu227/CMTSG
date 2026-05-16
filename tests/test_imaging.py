@@ -31,8 +31,19 @@ def test_formula_is_normalized_to_zero_one() -> None:
     assert np.allclose(gaf, (raw + 1.0) * 0.5)
 
 
+def test_gadf_uses_absolute_intensity() -> None:
+    values = np.array([0.0, 0.5, 1.0], dtype=np.float32)
+    gadf = gramian_angular_field(values, "GADF")
+    sin_values = np.sqrt(1 - values**2)
+    raw = np.outer(sin_values, values) - np.outer(values, sin_values)
+    assert np.allclose(gadf, np.abs(raw))
+    assert gadf.min() >= 0.0
+    assert gadf.max() <= 1.0
+
+
 if __name__ == "__main__":
     test_paa_keeps_means()
     test_gasf_range_and_shape()
     test_formula_is_normalized_to_zero_one()
+    test_gadf_uses_absolute_intensity()
     print("test_imaging.py: OK")

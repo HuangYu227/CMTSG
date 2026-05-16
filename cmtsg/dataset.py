@@ -12,6 +12,7 @@ except Exception:  # pragma: no cover
     Dataset = object
 
 from cmtsg.data import load_text_caps, load_ts, split_paths
+from cmtsg.imaging import gasf_multivariate
 from cmtsg.utils import resolve_path
 
 
@@ -24,6 +25,7 @@ class CMTSGDataset(Dataset):
         mean: np.ndarray | None = None,
         std: np.ndarray | None = None,
         train: bool = False,
+        gaf_max_size: int = 384,
     ) -> None:
         if torch is None:
             raise RuntimeError("CMTSGDataset requires PyTorch")
@@ -32,6 +34,7 @@ class CMTSGDataset(Dataset):
         self.caps = load_text_caps(caps_path)
         self.split = split
         self.train = train
+        self.gaf_max_size = int(gaf_max_size)
         self.processed_root = resolve_path(processed_root)
         emb_path = self.processed_root / f"{split}_text_emb.npy"
         if not emb_path.exists():
@@ -43,12 +46,13 @@ class CMTSGDataset(Dataset):
             self.text_emb = self.text_emb[:, None, :]
         if self.text_emb.shape[0] != self.ts.shape[0]:
             raise ValueError(f"Embedding count mismatch: {self.text_emb.shape} vs {self.ts.shape}")
-        if self.text_emb.shape[1] != self.caps.shape[1]:
+        if self.text_emb.shape[1] not in (1, self.caps.shape[1]):
             raise ValueError(f"Caption count mismatch: {self.text_emb.shape} vs {self.caps.shape}")
 
         self.mean = mean if mean is not None else self.ts.mean(axis=(0, 1), keepdims=True)
         self.std = std if std is not None else self.ts.std(axis=(0, 1), keepdims=True) + 1e-6
         self.ts_norm = (self.ts - self.mean) / self.std
+        self.gaf_size = min(int(self.ts.shape[1]), self.gaf_max_size)
 
     def __len__(self) -> int:
         return int(self.ts.shape[0])
@@ -60,6 +64,7 @@ class CMTSGDataset(Dataset):
             cap_idx = 0
         return {
             "x": torch.from_numpy(self.ts_norm[idx]).float(),
+            "gaf": torch.from_numpy(gasf_multivariate(self.ts[idx], max_size=self.gaf_max_size)).float(),
             "text_emb": torch.from_numpy(self.text_emb[idx, cap_idx]).float(),
             "caption_index": torch.tensor(cap_idx, dtype=torch.long),
         }

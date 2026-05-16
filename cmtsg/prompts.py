@@ -4,8 +4,14 @@ from pathlib import Path
 
 from cmtsg.utils import PROJECT_ROOT, normalize_dataset_name
 
+"""
+load_prompt_template 鲁棒性不够，只有两个文件夹。
 
+"""
 def _extract_block(text: str, marker: str) -> str:
+    """
+    marker_pos是用来结尾的一段字符串，提示词也就是system到这个marker_pos的一段文本。
+    """
     marker_pos = text.find(marker)
     if marker_pos < 0:
         raise ValueError(f"Prompt marker not found: {marker}")
@@ -19,6 +25,9 @@ def _extract_block(text: str, marker: str) -> str:
 
 
 def load_prompt_template(dataset: str, path: str | Path | None = None) -> str:
+    """
+    用来返回提取到的提示词文本，提取的依据是dataset和path。
+    """
     dataset = normalize_dataset_name(dataset)
     path = Path(path) if path is not None else PROJECT_ROOT / "prompts.txt"
     text = path.read_text(encoding="utf-8")
@@ -34,6 +43,9 @@ def fill_prompt(template: str, text_info: str, chart_stats: str = "") -> str:
 
 
 def compact_generation_condition_prompt(dataset: str, text_info: str, chart_stats: str = "") -> str:
+    """
+    这个提示词不够鲁邦，只有两个dataset的提示词。
+    """
     dataset = normalize_dataset_name(dataset)
     if dataset == "weather":
         return (

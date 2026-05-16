@@ -12,6 +12,7 @@ except Exception:  # pragma: no cover
         return iterable
 
 from cmtsg.utils import ensure_dir, normalize_dataset_name, resolve_path
+from cmtsg.data import load_text_caps
 
 
 def _load_texts(path: Path) -> np.ndarray:
@@ -83,7 +84,11 @@ class LongCLIPRunner:
 def run(args: argparse.Namespace) -> None:
     dataset = normalize_dataset_name(args.dataset)
     processed_root = ensure_dir(args.processed_root or f"processed/{dataset}")
-    texts = _load_texts(processed_root / f"{args.split}_causal_text.npy")
+    if args.source == "causal":
+        texts = _load_texts(processed_root / f"{args.split}_causal_text.npy")
+    else:
+        data_root = resolve_path(args.data_root or f"datasets/{dataset}")
+        texts = load_text_caps(data_root / f"{args.split}_text_caps.npy")
     limit = min(args.limit or texts.shape[0], texts.shape[0])
     texts = texts[:limit]
     flat = texts.reshape(-1).tolist()
@@ -111,6 +116,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Encode causal_text.npy with LongCLIP.")
     parser.add_argument("--dataset", required=True, choices=["weather", "synth-m"])
     parser.add_argument("--split", required=True, choices=["train", "valid", "test"])
+    parser.add_argument("--source", choices=["causal", "original"], default="causal")
+    parser.add_argument("--data-root", default=None)
     parser.add_argument("--processed-root", default=None)
     parser.add_argument("--longclip-path", default="pretrained/LongCLIP")
     parser.add_argument("--device", default="auto")

@@ -103,6 +103,30 @@ fid_cttp
 jftsd_cttp
 ```
 
+These training-time CTTP numbers are for internal model selection. They are
+computed on the sampled validation subset and are not protocol-identical to the
+official VerbalTS evaluator.
+
+For a paper-style comparison with VerbalTS, evaluate a saved checkpoint with the
+full VerbalTS protocol:
+
+```bash
+python -m cmtsg.evaluate_verbalts_protocol \
+  --config configs/synth_m.yaml \
+  --checkpoint runs/synth-m/checkpoints/best_jftsd_cttp.pt \
+  --output-root runs/synth-m \
+  --verbalts-root ../VerbalTS \
+  --cttp-root pretrained/synth-m_cttp \
+  --split test \
+  --sampler ddim \
+  --n-samples 10 \
+  --metric-caption-source original
+```
+
+This script matches the important VerbalTS evaluation choices: full test split,
+10 generated samples per condition with median aggregation, train-split CTTP
+feature caches for FID/JFTSD, and the VerbalTS Frechet-distance implementation.
+
 Use `evaluation.require_cttp: false` only for debugging infrastructure without
 semantic metrics.
 
