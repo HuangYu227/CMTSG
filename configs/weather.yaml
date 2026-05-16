@@ -30,9 +30,10 @@ model:
   depth: 12
   num_heads: 8
   mlp_ratio: 4.0
-  patch_size: 1
+  patch_size: 4
   dropout: 0.1
   text_tokens: 4
+  series_register_tokens: 64
   qk_rmsnorm: true
   softclamp: true
   n_env: 12
@@ -63,7 +64,7 @@ sampling:
   guidance_joint: 1.0
 
 training:
-  batch_size: 128
+  batch_size: 32
   epochs: 50
   lr: 0.0002
   weight_decay: 0.01

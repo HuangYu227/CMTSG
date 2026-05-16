@@ -37,6 +37,7 @@ def main() -> None:
         num_heads=4,
         architecture="causal_relation_mmdit",
         text_tokens=4,
+        series_register_tokens=8,
     )
     x = torch.randn(4, 36, 5)
     t = torch.randint(0, 50, (4,))

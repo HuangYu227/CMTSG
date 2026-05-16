@@ -55,6 +55,7 @@ def _make_model(cfg: dict, seq_len: int, n_vars: int, gaf_size: int) -> Gaussian
         env_slot_mode=str(model_cfg.get("env_slot_mode", "dynamic_gaf")),
         architecture=str(model_cfg.get("architecture", "causal_relation_mmdit")),
         text_tokens=int(model_cfg.get("text_tokens", 4)),
+        series_register_tokens=int(model_cfg.get("series_register_tokens", 64)),
         mmdit_dim_head=(int(model_cfg["mmdit_dim_head"]) if "mmdit_dim_head" in model_cfg else None),
         qk_rmsnorm=bool(model_cfg.get("qk_rmsnorm", True)),
         softclamp=bool(model_cfg.get("softclamp", True)),

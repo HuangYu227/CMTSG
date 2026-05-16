@@ -203,6 +203,71 @@ class SemanticTokenAdapter(nn.Module):
         return tokens + self.token_type.to(device=text_emb.device, dtype=text_emb.dtype)
 
 
+class SeriesRegisterResampler(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_registers: int = 64,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.num_registers = num_registers
+        self.register_tokens = nn.Parameter(torch.randn(1, num_registers, hidden_size) * 0.02)
+        self.norm_register = AdaptiveLayerNorm(hidden_size, hidden_size)
+        self.norm_series = AdaptiveLayerNorm(hidden_size, hidden_size)
+        self.cross_attn = nn.MultiheadAttention(hidden_size, num_heads, dropout=dropout, batch_first=True)
+        self.norm_ff = AdaptiveLayerNorm(hidden_size, hidden_size)
+        self.ff = FeedForward(hidden_size, mlp_ratio, dropout)
+        self.to_gates = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, hidden_size * 2))
+        nn.init.zeros_(self.to_gates[-1].weight)
+        nn.init.zeros_(self.to_gates[-1].bias)
+
+    def forward(self, series_tokens: torch.Tensor, cond: torch.Tensor, registers: torch.Tensor | None = None) -> torch.Tensor:
+        bsz, n_vars, n_tokens, hidden = series_tokens.shape
+        series_flat = series_tokens.reshape(bsz, n_vars * n_tokens, hidden)
+        if registers is None:
+            registers = self.register_tokens.to(device=series_tokens.device, dtype=series_tokens.dtype).expand(bsz, -1, -1)
+        gate_attn, gate_ff = self.to_gates(cond).chunk(2, dim=-1)
+        query = self.norm_register(registers, cond)
+        memory = self.norm_series(series_flat, cond)
+        attn_out, _ = self.cross_attn(query, memory, memory, need_weights=False)
+        registers = registers + gate_attn[:, None, :] * attn_out
+        registers = registers + gate_ff[:, None, :] * self.ff(self.norm_ff(registers, cond))
+        return registers
+
+
+class SeriesContextFeedback(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.norm_series = AdaptiveLayerNorm(hidden_size, hidden_size)
+        self.norm_context = AdaptiveLayerNorm(hidden_size, hidden_size)
+        self.cross_attn = nn.MultiheadAttention(hidden_size, num_heads, dropout=dropout, batch_first=True)
+        self.norm_ff = AdaptiveLayerNorm(hidden_size, hidden_size)
+        self.ff = FeedForward(hidden_size, mlp_ratio, dropout)
+        self.to_gates = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, hidden_size * 2))
+        nn.init.zeros_(self.to_gates[-1].weight)
+        nn.init.zeros_(self.to_gates[-1].bias)
+
+    def forward(self, series_tokens: torch.Tensor, context_tokens: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        bsz, n_vars, n_tokens, hidden = series_tokens.shape
+        series_flat = series_tokens.reshape(bsz, n_vars * n_tokens, hidden)
+        gate_attn, gate_ff = self.to_gates(cond).chunk(2, dim=-1)
+        query = self.norm_series(series_flat, cond)
+        context = self.norm_context(context_tokens, cond)
+        attn_out, _ = self.cross_attn(query, context, context, need_weights=False)
+        series_flat = series_flat + gate_attn[:, None, :] * attn_out
+        series_flat = series_flat + gate_ff[:, None, :] * self.ff(self.norm_ff(series_flat, cond))
+        return series_flat.reshape(bsz, n_vars, n_tokens, hidden)
+
+
 class TriModalMMDiTBlock(nn.Module):
     def __init__(
         self,
@@ -213,9 +278,17 @@ class TriModalMMDiTBlock(nn.Module):
         dim_head: int | None = None,
         qk_rmsnorm: bool = True,
         softclamp: bool = True,
+        series_register_tokens: int = 64,
     ) -> None:
         super().__init__()
         self.series_structure = SeriesStructureBlock(hidden_size, num_heads, dropout)
+        self.series_resampler = SeriesRegisterResampler(
+            hidden_size,
+            num_heads,
+            num_registers=series_register_tokens,
+            mlp_ratio=mlp_ratio,
+            dropout=dropout,
+        )
         self.attn_norms = nn.ModuleList([AdaptiveLayerNorm(hidden_size, hidden_size) for _ in range(3)])
         self.joint_attn = TriModalJointAttention(
             (hidden_size, hidden_size, hidden_size),
@@ -237,14 +310,14 @@ class TriModalMMDiTBlock(nn.Module):
     def forward(
         self,
         series_tokens: torch.Tensor,
+        series_registers: torch.Tensor | None,
         semantic_tokens: torch.Tensor,
         relation_tokens: torch.Tensor,
         cond: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         series_tokens = self.series_structure(series_tokens, cond)
-        bsz, n_vars, n_tokens, hidden = series_tokens.shape
-        series_flat = series_tokens.reshape(bsz, n_vars * n_tokens, hidden)
-        streams = (series_flat, semantic_tokens, relation_tokens)
+        series_registers = self.series_resampler(series_tokens, cond, series_registers)
+        streams = (series_registers, semantic_tokens, relation_tokens)
 
         attn_in = tuple(norm(tokens, cond) for tokens, norm in zip(streams, self.attn_norms))
         attn_out = self.joint_attn(attn_in)  # type: ignore[arg-type]
@@ -255,8 +328,8 @@ class TriModalMMDiTBlock(nn.Module):
         ff_out = tuple(ff(tokens) for tokens, ff in zip(ff_in, self.ff))
         ff_gates = self.ff_gates(cond).chunk(3, dim=-1)
         streams = tuple(tokens + gate[:, None, :] * out for tokens, gate, out in zip(streams, ff_gates, ff_out))
-        series_flat, semantic_tokens, relation_tokens = streams
-        return series_flat.reshape(bsz, n_vars, n_tokens, hidden), semantic_tokens, relation_tokens
+        series_registers, semantic_tokens, relation_tokens = streams
+        return series_tokens, series_registers, semantic_tokens, relation_tokens
 
 
 class CausalRelationMMDiTDenoiser(nn.Module):
@@ -273,6 +346,7 @@ class CausalRelationMMDiTDenoiser(nn.Module):
         patch_size: int = 1,
         dropout: float = 0.0,
         text_tokens: int = 4,
+        series_register_tokens: int = 64,
         dim_head: int | None = None,
         qk_rmsnorm: bool = True,
         softclamp: bool = True,
@@ -301,10 +375,12 @@ class CausalRelationMMDiTDenoiser(nn.Module):
                     dim_head=dim_head,
                     qk_rmsnorm=qk_rmsnorm,
                     softclamp=softclamp,
+                    series_register_tokens=series_register_tokens,
                 )
                 for _ in range(depth)
             ]
         )
+        self.context_feedback = SeriesContextFeedback(hidden_size, num_heads, mlp_ratio, dropout)
         self.final_layer = FinalLayer(hidden_size, patch_size)
         self.series_summary_norm = nn.LayerNorm(hidden_size)
         self.semantic_summary_norm = nn.LayerNorm(hidden_size)
@@ -330,10 +406,21 @@ class CausalRelationMMDiTDenoiser(nn.Module):
         cond = self._condition(t, text_emb, env_mix)
         semantic_tokens = self.semantic_adapter(text_emb if semantic_text_emb is None else semantic_text_emb)
         relation_tokens = self.relation_proj(env_tokens)
+        series_registers = None
 
         for block in self.blocks:
-            series_tokens, semantic_tokens, relation_tokens = block(series_tokens, semantic_tokens, relation_tokens, cond)
+            series_tokens, series_registers, semantic_tokens, relation_tokens = block(
+                series_tokens,
+                series_registers,
+                semantic_tokens,
+                relation_tokens,
+                cond,
+            )
 
+        if series_registers is None:
+            raise RuntimeError("CausalRelationMMDiTDenoiser produced no series registers")
+        context_tokens = torch.cat([series_registers, semantic_tokens, relation_tokens], dim=1)
+        series_tokens = self.context_feedback(series_tokens, context_tokens, cond)
         patches = self.final_layer(series_tokens, cond)
         out = patches.permute(0, 2, 3, 1).contiguous().reshape(x.shape[0], -1, self.n_vars)
         if pad_len:
@@ -342,7 +429,7 @@ class CausalRelationMMDiTDenoiser(nn.Module):
         if not return_aux:
             return out
         aux = {
-            "series_summary": self.series_summary_norm(series_tokens.mean(dim=(1, 2))),
+            "series_summary": self.series_summary_norm(series_registers.mean(dim=1)),
             "semantic_summary": self.semantic_summary_norm(semantic_tokens.mean(dim=1)),
             "relation_summary": self.relation_summary_norm(relation_tokens.mean(dim=1)),
         }

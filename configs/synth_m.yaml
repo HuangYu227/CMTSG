@@ -33,6 +33,7 @@ model:
   patch_size: 4
   dropout: 0.1
   text_tokens: 4
+  series_register_tokens: 64
   qk_rmsnorm: true
   softclamp: true
   n_env: 12
