@@ -15,6 +15,7 @@ diffusion:
   beta_end: 0.02
   schedule: quad
   lambda_spectral: 0.05
+  lambda_ground: 0.03
   spectral_warmup_power: 1.0
   spectral_mode: abs
   spectral_high_freq_gamma: 1.0

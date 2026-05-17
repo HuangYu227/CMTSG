@@ -117,16 +117,20 @@ class TriModalJointAttention(nn.Module):
         attn_logits = torch.matmul(q, k.transpose(-1, -2)) * self.scale
         pair_bias = self.relation_pair_bias(inputs[2].mean(dim=1))
         pair_bias = pair_bias.reshape(inputs[0].shape[0], self.num_heads, len(inputs), len(inputs))
-        q_start = 0
-        for q_idx, q_len in enumerate(lengths):
-            k_start = 0
-            for k_idx, k_len in enumerate(lengths):
-                attn_logits[:, :, q_start : q_start + q_len, k_start : k_start + k_len] = (
-                    attn_logits[:, :, q_start : q_start + q_len, k_start : k_start + k_len]
-                    + pair_bias[:, :, q_idx, k_idx][:, :, None, None]
-                )
-                k_start += k_len
-            q_start += q_len
+        # Vectorized block bias: assign each position its modality index,
+        # then gather pair_bias via advanced indexing — fully GPU-parallel.
+        device = attn_logits.device
+        num_mods = len(lengths)
+        q_idx_map = torch.zeros(sum(lengths), dtype=torch.long, device=device)
+        k_idx_map = torch.zeros(sum(lengths), dtype=torch.long, device=device)
+        offset = 0
+        for i, length in enumerate(lengths):
+            q_idx_map[offset:offset + length] = i
+            k_idx_map[offset:offset + length] = i
+            offset += length
+        # pair_bias [B, H, M, M] -> gather [B, H, L, L]
+        bias = pair_bias[:, :, q_idx_map[:, None], k_idx_map[None, :]]
+        attn_logits = attn_logits + bias
         if self.softclamp:
             attn_logits = (attn_logits / self.softclamp_value).tanh() * self.softclamp_value
         packed_masks = []

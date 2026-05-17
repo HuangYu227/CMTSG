@@ -21,34 +21,6 @@ def extract(values: torch.Tensor, t: torch.Tensor, shape: torch.Size) -> torch.T
     return out.reshape(t.shape[0], *((1,) * (len(shape) - 1)))
 
 
-def triad_contrastive_loss(
-    series_summary: torch.Tensor | None,
-    semantic_summary: torch.Tensor | None,
-    relation_summary: torch.Tensor | None,
-    temperature: float = 0.07,
-) -> torch.Tensor:
-    if series_summary is None or semantic_summary is None or relation_summary is None:
-        fallback = series_summary if series_summary is not None else semantic_summary if semantic_summary is not None else relation_summary
-        if fallback is None:
-            raise ValueError("At least one tensor is required to infer device for a zero contrastive loss")
-        return fallback.new_zeros(())
-    if series_summary.shape[0] < 2:
-        return series_summary.new_zeros(())
-
-    def pair_loss(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        a = F.normalize(a, dim=-1)
-        b = F.normalize(b, dim=-1)
-        logits = a @ b.transpose(0, 1) / temperature
-        labels = torch.arange(a.shape[0], device=a.device)
-        return 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.transpose(0, 1), labels))
-
-    return (
-        pair_loss(series_summary, semantic_summary)
-        + pair_loss(series_summary, relation_summary)
-        + pair_loss(semantic_summary, relation_summary)
-    ) / 3.0
-
-
 class GADFRelationalSpectralLoss(nn.Module):
     def __init__(
         self,
@@ -121,16 +93,24 @@ class GaussianDiffusion(nn.Module):
         beta_end: float = 0.02,
         schedule: str = "quad",
         lambda_spectral: float = 0.05,
+        lambda_ground: float = 0.03,
         spectral_warmup_power: float = 1.0,
         spectral_mode: str = "abs",
         spectral_high_freq_gamma: float = 1.0,
         spectral_dc_weight: float = 0.05,
+        lambda_cycle_relation: float = 0.01,
+        lambda_triad_contrastive: float = 0.01,
+        contrastive_temperature: float = 0.07,
     ) -> None:
         super().__init__()
         self.model = model
         self.num_steps = num_steps
         self.lambda_spectral = float(lambda_spectral)
+        self.lambda_ground = float(lambda_ground)
         self.spectral_warmup_power = float(spectral_warmup_power)
+        self.lambda_cycle_relation = float(lambda_cycle_relation)
+        self.lambda_triad_contrastive = float(lambda_triad_contrastive)
+        self.contrastive_temperature = float(contrastive_temperature)
         betas = make_beta_schedule(num_steps, beta_start, beta_end, schedule)
         alphas = 1.0 - betas
         alpha_bars = torch.cumprod(alphas, dim=0)
@@ -175,54 +155,54 @@ class GaussianDiffusion(nn.Module):
         gaf: torch.Tensor | None = None,
         semantic_atoms: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        from cmtsg.models.losses import compute_all_losses
+
         self._validate_condition_batch(x_start.shape[0], text_emb, gaf, semantic_atoms)
         t = torch.randint(0, self.num_steps, (x_start.shape[0],), device=x_start.device)
         noise = torch.randn_like(x_start)
         x_noisy = self.q_sample(x_start, t, noise)
         pred_noise, aux = self.model(x_noisy, t, text_emb, gaf, semantic_atoms=semantic_atoms)
-        loss_diff = F.mse_loss(pred_noise, noise)
-        if self.lambda_spectral > 0.0:
-            sqrt_ab = extract(self.sqrt_alpha_bars, t, x_start.shape)
-            sqrt_omab = extract(self.sqrt_one_minus_alpha_bars, t, x_start.shape)
-            x0_pred = (x_noisy - sqrt_omab * pred_noise) / sqrt_ab
-            x0_pred = x0_pred.clamp(-5.0, 5.0)
-            loss_spectral_per_sample = self.gadf_spectral_loss(x0_pred, x_start)
-            alpha_bar_t = extract(self.alpha_bars, t, x_start.shape).reshape(x_start.shape[0])
-            spectral_weight = alpha_bar_t.pow(self.spectral_warmup_power).detach()
-            loss_spectral = (loss_spectral_per_sample * spectral_weight).mean()
-        else:
-            loss_spectral = loss_diff.new_zeros(())
-            spectral_weight = loss_diff.new_zeros(())
-        slot_aux_loss = aux.get("slot_aux_loss", loss_diff.new_zeros(()))
-        grounding_aux_loss = aux.get("grounding_aux_loss", loss_diff.new_zeros(()))
-        loss = loss_diff + self.lambda_spectral * loss_spectral + slot_aux_loss + grounding_aux_loss
-        metrics = {
-            "loss": loss.detach(),
-            "loss_diff": loss_diff.detach(),
-            "loss_spectral": loss_spectral.detach(),
-            "loss_slot_aux": slot_aux_loss.detach(),
-            "loss_grounding_aux": grounding_aux_loss.detach(),
-            "grounding_loss_ot": aux.get("grounding_loss_ot", loss_diff.new_zeros(())).detach(),
-            "grounding_loss_mask": aux.get("grounding_loss_mask", loss_diff.new_zeros(())).detach(),
-            "grounding_loss_cycle": aux.get("grounding_loss_cycle", loss_diff.new_zeros(())).detach(),
-            "grounding_transport_entropy": aux.get("grounding_transport_entropy", loss_diff.new_zeros(())).detach(),
-            "grounding_transport_row_error": aux.get("grounding_transport_row_error", loss_diff.new_zeros(())).detach(),
-            "grounding_transport_col_error": aux.get("grounding_transport_col_error", loss_diff.new_zeros(())).detach(),
-            "slot_diversity_loss": aux.get("slot_diversity_loss", loss_diff.new_zeros(())).detach(),
-            "route_entropy_loss": aux.get("route_entropy_loss", loss_diff.new_zeros(())).detach(),
-            "text_slot_align_loss": aux.get("text_slot_align_loss", loss_diff.new_zeros(())).detach(),
-            "text_env_slot_loss": aux.get("text_env_slot_loss", loss_diff.new_zeros(())).detach(),
-            "slot_cosine_mean": aux.get("slot_cosine_mean", loss_diff.new_zeros(())).detach(),
-            "route_entropy_scale": aux.get("route_entropy_scale", loss_diff.new_zeros(())).detach(),
-            "spectral_weight": spectral_weight.mean().detach(),
-            "route_entropy": aux["route_entropy"].detach(),
-            "route_max": aux["route_max"].detach(),
-            "text_drop_rate": aux.get("text_drop_rate", torch.tensor(0.0, device=x_start.device)).detach(),
-            "env_drop_rate": aux.get("env_drop_rate", torch.tensor(0.0, device=x_start.device)).detach(),
-            "semantic_drop_rate": aux.get("semantic_drop_rate", torch.tensor(0.0, device=x_start.device)).detach(),
-            "debug_env_slots_shape": str(tuple(aux["env_slots"].shape)),
-            "debug_env_mix_shape": str(tuple(aux["env_mix"].shape)),
-        }
+
+        # Reconstruct x0 from predicted noise
+        sqrt_ab = extract(self.sqrt_alpha_bars, t, x_start.shape)
+        sqrt_omab = extract(self.sqrt_one_minus_alpha_bars, t, x_start.shape)
+        x0_pred = ((x_noisy - sqrt_omab * pred_noise) / sqrt_ab).clamp(-5.0, 5.0)
+
+        # L1: flow matching equivalent (MSE on noise prediction ≡ MSE on x0)
+        loss_flow = F.mse_loss(pred_noise, noise)
+        aux["loss_flow"] = loss_flow
+
+        # GaussianDiffusion spectral warmup: alpha_bar_t^power instead of (1-t)^power
+        alpha_bar_t = extract(self.alpha_bars, t, x_start.shape).reshape(x_start.shape[0])
+        spectral_weight_per_sample = alpha_bar_t.pow(self.spectral_warmup_power)
+
+        # Cycle relation slots from predicted x0
+        pred_relation_slots = None
+        env_slots_for_cycle = aux.get("env_slots") if gaf is not None else None
+        if env_slots_for_cycle is not None and hasattr(self.model, "relation_slots_from_gaf"):
+            x_true_t = x_start.transpose(1, 2)
+            ref_min = x_true_t.amin(dim=-1, keepdim=True).detach()
+            ref_max = x_true_t.amax(dim=-1, keepdim=True).detach()
+            pred_gaf = self.gadf_spectral_loss.compute_gadf_field(x0_pred, ref_min, ref_max)
+            pred_relation_slots = self.model.relation_slots_from_gaf(pred_gaf)
+
+        loss, metrics = compute_all_losses(
+            aux=aux,
+            x0_pred=x0_pred,
+            x_start=x_start,
+            t=t,
+            pred_relation_slots=pred_relation_slots,
+            gadf_loss=self.gadf_spectral_loss,
+            spectral_warmup_power=self.spectral_warmup_power,
+            contrastive_temperature=self.contrastive_temperature,
+            lambda_ground=self.lambda_ground,
+            lambda_spectral=self.lambda_spectral,
+            lambda_triad=self.lambda_triad_contrastive,
+            lambda_cycle_relation=self.lambda_cycle_relation,
+            spectral_weight_per_sample=spectral_weight_per_sample,
+        )
+        # Backward-compatible aliases
+        metrics["loss_diff"] = metrics["loss_l1_flow"]
         return loss, metrics
 
     @torch.no_grad()
@@ -294,6 +274,7 @@ class RectifiedFlow(nn.Module):
         model: nn.Module,
         num_steps: int = 100,
         lambda_spectral: float = 0.05,
+        lambda_ground: float = 0.03,
         spectral_warmup_power: float = 1.0,
         spectral_mode: str = "abs",
         spectral_high_freq_gamma: float = 1.0,
@@ -313,6 +294,7 @@ class RectifiedFlow(nn.Module):
         self.model = model
         self.num_steps = int(num_steps)
         self.lambda_spectral = float(lambda_spectral)
+        self.lambda_ground = float(lambda_ground)
         self.spectral_warmup_power = float(spectral_warmup_power)
         self.lambda_cycle_relation = float(lambda_cycle_relation)
         self.lambda_triad_contrastive = float(lambda_triad_contrastive)
@@ -345,16 +327,6 @@ class RectifiedFlow(nn.Module):
     def _model_time(self, t: torch.Tensor) -> torch.Tensor:
         return t * float(self.num_steps)
 
-    def _cycle_relation_loss(self, x0_pred: torch.Tensor, x_start: torch.Tensor, target_slots: torch.Tensor | None) -> torch.Tensor:
-        if self.lambda_cycle_relation <= 0.0 or target_slots is None or not hasattr(self.model, "relation_slots_from_gaf"):
-            return x0_pred.new_zeros(())
-        x_true_t = x_start.transpose(1, 2)
-        ref_min = x_true_t.amin(dim=-1, keepdim=True).detach()
-        ref_max = x_true_t.amax(dim=-1, keepdim=True).detach()
-        pred_gaf = self.gadf_spectral_loss.compute_gadf_field(x0_pred, ref_min, ref_max)
-        pred_slots = self.model.relation_slots_from_gaf(pred_gaf)
-        return 1.0 - F.cosine_similarity(pred_slots, target_slots.detach(), dim=-1).mean()
-
     def training_loss(
         self,
         x_start: torch.Tensor,
@@ -362,6 +334,8 @@ class RectifiedFlow(nn.Module):
         gaf: torch.Tensor | None = None,
         semantic_atoms: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        from cmtsg.models.losses import compute_all_losses
+
         self._validate_condition_batch(x_start.shape[0], text_emb, gaf, semantic_atoms)
         bsz = x_start.shape[0]
         t = torch.rand(bsz, device=x_start.device)
@@ -378,66 +352,36 @@ class RectifiedFlow(nn.Module):
             semantic_atoms=semantic_atoms,
         )
         loss_flow = F.mse_loss(pred_v, target_v)
+        aux["loss_flow"] = loss_flow
 
         x0_pred = (x_t - t_view * pred_v).clamp(-5.0, 5.0)
-        if self.lambda_spectral > 0.0:
-            loss_spectral_per_sample = self.gadf_spectral_loss(x0_pred, x_start)
-            spectral_weight = (1.0 - t).pow(self.spectral_warmup_power).detach()
-            loss_spectral = (loss_spectral_per_sample * spectral_weight).mean()
-        else:
-            loss_spectral = loss_flow.new_zeros(())
-            spectral_weight = loss_flow.new_zeros(())
 
-        slot_aux_loss = aux.get("slot_aux_loss", loss_flow.new_zeros(()))
-        grounding_aux_loss = aux.get("grounding_aux_loss", loss_flow.new_zeros(()))
-        loss_cycle_relation = self._cycle_relation_loss(x0_pred, x_start, aux.get("env_slots") if gaf is not None else None)
-        if {"series_summary", "semantic_summary", "relation_summary"}.issubset(aux):
-            loss_triad = triad_contrastive_loss(
-                aux.get("series_summary"),
-                aux.get("semantic_summary"),
-                aux.get("relation_summary"),
-                temperature=self.contrastive_temperature,
-            )
-        else:
-            loss_triad = loss_flow.new_zeros(())
-        loss = (
-            loss_flow
-            + self.lambda_spectral * loss_spectral
-            + slot_aux_loss
-            + grounding_aux_loss
-            + self.lambda_cycle_relation * loss_cycle_relation
-            + self.lambda_triad_contrastive * loss_triad
+        # Compute cycle relation slots from predicted x0
+        pred_relation_slots = None
+        env_slots_for_cycle = aux.get("env_slots") if gaf is not None else None
+        if env_slots_for_cycle is not None and hasattr(self.model, "relation_slots_from_gaf"):
+            x_true_t = x_start.transpose(1, 2)
+            ref_min = x_true_t.amin(dim=-1, keepdim=True).detach()
+            ref_max = x_true_t.amax(dim=-1, keepdim=True).detach()
+            pred_gaf = self.gadf_spectral_loss.compute_gadf_field(x0_pred, ref_min, ref_max)
+            pred_relation_slots = self.model.relation_slots_from_gaf(pred_gaf)
+
+        loss, metrics = compute_all_losses(
+            aux=aux,
+            x0_pred=x0_pred,
+            x_start=x_start,
+            t=t,
+            pred_relation_slots=pred_relation_slots,
+            gadf_loss=self.gadf_spectral_loss,
+            spectral_warmup_power=self.spectral_warmup_power,
+            contrastive_temperature=self.contrastive_temperature,
+            lambda_ground=self.lambda_ground,
+            lambda_spectral=self.lambda_spectral,
+            lambda_triad=self.lambda_triad_contrastive,
+            lambda_cycle_relation=self.lambda_cycle_relation,
         )
-        metrics = {
-            "loss": loss.detach(),
-            "loss_flow": loss_flow.detach(),
-            "loss_diff": loss_flow.detach(),
-            "loss_spectral": loss_spectral.detach(),
-            "loss_slot_aux": slot_aux_loss.detach(),
-            "loss_grounding_aux": grounding_aux_loss.detach(),
-            "loss_cycle_relation": loss_cycle_relation.detach(),
-            "loss_triad_contrastive": loss_triad.detach(),
-            "grounding_loss_ot": aux.get("grounding_loss_ot", loss_flow.new_zeros(())).detach(),
-            "grounding_loss_mask": aux.get("grounding_loss_mask", loss_flow.new_zeros(())).detach(),
-            "grounding_loss_cycle": aux.get("grounding_loss_cycle", loss_flow.new_zeros(())).detach(),
-            "grounding_transport_entropy": aux.get("grounding_transport_entropy", loss_flow.new_zeros(())).detach(),
-            "grounding_transport_row_error": aux.get("grounding_transport_row_error", loss_flow.new_zeros(())).detach(),
-            "grounding_transport_col_error": aux.get("grounding_transport_col_error", loss_flow.new_zeros(())).detach(),
-            "slot_diversity_loss": aux.get("slot_diversity_loss", loss_flow.new_zeros(())).detach(),
-            "route_entropy_loss": aux.get("route_entropy_loss", loss_flow.new_zeros(())).detach(),
-            "text_slot_align_loss": aux.get("text_slot_align_loss", loss_flow.new_zeros(())).detach(),
-            "text_env_slot_loss": aux.get("text_env_slot_loss", loss_flow.new_zeros(())).detach(),
-            "slot_cosine_mean": aux.get("slot_cosine_mean", loss_flow.new_zeros(())).detach(),
-            "route_entropy_scale": aux.get("route_entropy_scale", loss_flow.new_zeros(())).detach(),
-            "spectral_weight": spectral_weight.mean().detach(),
-            "route_entropy": aux["route_entropy"].detach(),
-            "route_max": aux["route_max"].detach(),
-            "text_drop_rate": aux.get("text_drop_rate", torch.tensor(0.0, device=x_start.device)).detach(),
-            "env_drop_rate": aux.get("env_drop_rate", torch.tensor(0.0, device=x_start.device)).detach(),
-            "semantic_drop_rate": aux.get("semantic_drop_rate", torch.tensor(0.0, device=x_start.device)).detach(),
-            "debug_env_slots_shape": str(tuple(aux["env_slots"].shape)),
-            "debug_env_mix_shape": str(tuple(aux["env_mix"].shape)),
-        }
+        # loss_diff alias for backward compatibility with logging
+        metrics["loss_diff"] = metrics["loss_l1_flow"]
         return loss, metrics
 
     @torch.no_grad()

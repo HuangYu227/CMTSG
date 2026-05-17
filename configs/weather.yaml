@@ -16,6 +16,7 @@ diffusion:
   beta_end: 0.02
   schedule: quad
   lambda_spectral: 0.05
+  lambda_ground: 0.03
   lambda_cycle_relation: 0.01
   lambda_triad_contrastive: 0.01
   contrastive_temperature: 0.07
@@ -72,12 +73,12 @@ sampling:
   guidance_joint: 1.0
 
 training:
-  batch_size: 32
+  batch_size: 256
   epochs: 50
   lr: 0.0002
   weight_decay: 0.01
   grad_clip: 1.0
-  num_workers: 0
+  num_workers: 4
   save_every: 10
 
 evaluation:
