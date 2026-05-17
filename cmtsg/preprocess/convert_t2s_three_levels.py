@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 
+from cmtsg.preprocess.precompute_gaf import precompute_split
 from cmtsg.utils import ensure_dir, resolve_path
 
 
@@ -154,6 +155,9 @@ def convert_one(
     seed: int,
     t2s_train_proportion: float,
     valid_ratio: float,
+    precompute_gaf: bool = False,
+    gaf_max_size: int = 384,
+    overwrite_gaf: bool = False,
 ) -> dict[str, object]:
     rows = _read_csv_rows(source, dataset, horizon)
     indices = _split_indices(rows.series.shape[0], seed, t2s_train_proportion, valid_ratio)
@@ -176,6 +180,11 @@ def convert_one(
     }
     (data_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     (processed_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    if precompute_gaf:
+        meta["gaf_cache"] = {
+            split: precompute_split(data_dir, split, max_size=gaf_max_size, overwrite=overwrite_gaf)
+            for split in ("train", "valid", "test")
+        }
     return meta
 
 
@@ -189,6 +198,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--t2s-train-proportion", type=float, default=0.99)
     parser.add_argument("--valid-ratio", type=float, default=0.01)
+    parser.add_argument("--precompute-gaf", action="store_true", help="Also create train/valid/test_gaf.npy caches.")
+    parser.add_argument("--gaf-max-size", type=int, default=384)
+    parser.add_argument("--overwrite-gaf", action="store_true")
     return parser
 
 
@@ -207,6 +219,9 @@ def main() -> None:
                     seed=args.seed,
                     t2s_train_proportion=args.t2s_train_proportion,
                     valid_ratio=args.valid_ratio,
+                    precompute_gaf=args.precompute_gaf,
+                    gaf_max_size=args.gaf_max_size,
+                    overwrite_gaf=args.overwrite_gaf,
                 )
                 print(
                     f"{dataset}_{horizon}: samples={meta['samples']} "

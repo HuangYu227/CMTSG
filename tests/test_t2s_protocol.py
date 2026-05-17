@@ -43,6 +43,7 @@ def main() -> None:
 
     from cmtsg.metrics import acf_error, correlation_error, mse, t2s_metric_suite, wape
     from cmtsg.preprocess.convert_t2s_three_levels import T2SSource, convert_one
+    from cmtsg.preprocess.precompute_gaf import precompute_split
 
     real = np.arange(4 * 24, dtype=np.float32).reshape(4, 24, 1)
     gen = real.copy()
@@ -81,6 +82,13 @@ def main() -> None:
         assert train_ts.ndim == 3 and train_ts.shape[1:] == (24, 1)
         assert valid_ts.ndim == 3 and test_ts.ndim == 3
         assert train_emb.ndim == 3 and train_emb.shape[1:] == (1, 128)
+        gaf_meta = precompute_split(tmp_path / "datasets" / "traffic_24", "train", max_size=384)
+        assert gaf_meta["status"] == "created"
+        train_gaf = np.load(tmp_path / "datasets" / "traffic_24" / "train_gaf.npy", mmap_mode="r")
+        assert train_gaf.shape == (train_ts.shape[0], 1, 24, 24)
+        del train_gaf
+        cached_meta = precompute_split(tmp_path / "datasets" / "traffic_24", "train", max_size=384)
+        assert cached_meta["status"] == "exists"
     print("test_t2s_protocol.py: OK")
 
 

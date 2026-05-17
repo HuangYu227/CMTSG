@@ -25,7 +25,8 @@ python -m cmtsg.preprocess.convert_t2s_three_levels \
   --data-root "${DATA_ROOT}" \
   --processed-root "${PROCESSED_ROOT}" \
   --datasets traffic airquality ettm1 \
-  --horizons 24 48 96
+  --horizons 24 48 96 \
+  --precompute-gaf
 
 CONFIGS=(
   configs/t2s/traffic_24.yaml

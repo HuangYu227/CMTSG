@@ -29,6 +29,7 @@ class CMTSGDataset(Dataset):
     ) -> None:
         if torch is None:
             raise RuntimeError("CMTSGDataset requires PyTorch")
+        self.data_root = resolve_path(data_root)
         ts_path, caps_path = split_paths(data_root, split)
         self.ts = load_ts(ts_path)
         self.caps = load_text_caps(caps_path)
@@ -54,6 +55,7 @@ class CMTSGDataset(Dataset):
         self.std = std if std is not None else self.ts.std(axis=(0, 1), keepdims=True) + 1e-6
         self.ts_norm = (self.ts - self.mean) / self.std
         self.gaf_size = min(int(self.ts.shape[1]), self.gaf_max_size)
+        self.gaf_cache = self._load_gaf_cache()
 
     def __len__(self) -> int:
         return int(self.ts.shape[0])
@@ -84,14 +86,30 @@ class CMTSGDataset(Dataset):
             return self.text_emb
         return None
 
+    def _load_gaf_cache(self) -> np.ndarray | None:
+        cache_path = self.data_root / f"{self.split}_gaf.npy"
+        if not cache_path.exists():
+            return None
+        gaf = np.load(cache_path, mmap_mode="r")
+        expected = (self.ts.shape[0], self.ts.shape[2], self.gaf_size, self.gaf_size)
+        if tuple(gaf.shape) != expected:
+            raise ValueError(f"GAF cache shape mismatch: {cache_path} has {gaf.shape}, expected {expected}")
+        if gaf.dtype != np.float32:
+            raise ValueError(f"GAF cache must be float32: {cache_path} has dtype={gaf.dtype}")
+        return gaf
+
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         if self.train:
             cap_idx = np.random.randint(0, self.text_emb.shape[1])
         else:
             cap_idx = 0
+        if self.gaf_cache is None:
+            gaf = gasf_multivariate(self.ts[idx], max_size=self.gaf_max_size)
+        else:
+            gaf = np.array(self.gaf_cache[idx], dtype=np.float32, copy=True)
         item = {
             "x": torch.from_numpy(self.ts_norm[idx]).float(),
-            "gaf": torch.from_numpy(gasf_multivariate(self.ts[idx], max_size=self.gaf_max_size)).float(),
+            "gaf": torch.from_numpy(gaf).float(),
             "text_emb": torch.from_numpy(self.text_emb[idx, cap_idx]).float(),
             "caption_index": torch.tensor(cap_idx, dtype=torch.long),
         }
