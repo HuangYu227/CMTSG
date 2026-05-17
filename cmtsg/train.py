@@ -147,7 +147,7 @@ def _optional_to_device(batch: dict, key: str, device: torch.device) -> torch.Te
     value = batch.get(key)
     if value is None:
         return None
-    return value.to(device)
+    return value.to(device, non_blocking=True)
 
 
 def _shape_str(value: torch.Tensor | None) -> str:
@@ -159,15 +159,14 @@ def _shape_str(value: torch.Tensor | None) -> str:
 def _module_grad_norm(module: torch.nn.Module | None) -> float:
     if module is None:
         return 0.0
-    total = 0.0
-    found = False
+    values = []
     for param in module.parameters():
         if param.grad is None:
             continue
-        grad = param.grad.detach()
-        total += float(grad.pow(2).sum().cpu())
-        found = True
-    return float(total**0.5) if found else 0.0
+        values.append(param.grad.detach().float().pow(2).sum())
+    if not values:
+        return 0.0
+    return float(torch.stack(values).sum().sqrt().item())
 
 
 def _debug_modules(diffusion: GaussianDiffusion | RectifiedFlow) -> tuple[torch.nn.Module | None, torch.nn.Module | None, torch.nn.Module | None]:
@@ -177,6 +176,30 @@ def _debug_modules(diffusion: GaussianDiffusion | RectifiedFlow) -> tuple[torch.
     gaf_encoder = getattr(router, "encoder", None) if router is not None else None
     grounding = getattr(dit, "semantic_grounding", None) if dit is not None else None
     return gaf_encoder, grounding, dit
+
+
+def _record(values: list[torch.Tensor], value: torch.Tensor) -> None:
+    values.append(value.detach())
+
+
+def _mean_scalar(values: list[torch.Tensor] | list[float]) -> float:
+    if not values:
+        return 0.0
+    first = values[0]
+    if torch.is_tensor(first):
+        return float(torch.stack([item.float() for item in values]).mean().item())
+    return float(np.mean(values))
+
+
+def _loader_kwargs(num_workers: int, device: torch.device) -> dict:
+    kwargs = {
+        "num_workers": int(num_workers),
+        "pin_memory": device.type == "cuda",
+    }
+    if num_workers > 0:
+        kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = 4
+    return kwargs
 
 
 def train(args: argparse.Namespace) -> None:
@@ -198,14 +221,20 @@ def train(args: argparse.Namespace) -> None:
     train_ds = CMTSGDataset(data_root, processed_root, "train", mean=mean, std=std, train=True, gaf_max_size=gaf_max_size)
     valid_ds = CMTSGDataset(data_root, processed_root, "valid", mean=mean, std=std, train=False, gaf_max_size=gaf_max_size)
     batch_size = int(args.batch_size or get_nested(cfg, "training.batch_size", 128))
+    num_workers = int(get_nested(cfg, "training.num_workers", 0))
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=int(get_nested(cfg, "training.num_workers", 0)),
         drop_last=True,
+        **_loader_kwargs(num_workers, device),
     )
-    valid_loader = DataLoader(valid_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    valid_loader = DataLoader(
+        valid_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        **_loader_kwargs(max(1, min(num_workers, 2)), device),
+    )
 
     diffusion = _make_model(cfg, seq_len, n_vars, gaf_size).to(device)
     optimizer = torch.optim.AdamW(
@@ -214,6 +243,7 @@ def train(args: argparse.Namespace) -> None:
         weight_decay=float(get_nested(cfg, "training.weight_decay", 0.01)),
     )
     grad_clip = float(get_nested(cfg, "training.grad_clip", 1.0))
+    grad_norm_every = int(get_nested(cfg, "training.grad_norm_every", 50))
     epochs = int(args.epochs or get_nested(cfg, "training.epochs", 50))
     best_val = float("inf")
     stats = {
@@ -282,18 +312,19 @@ def train(args: argparse.Namespace) -> None:
         train_grounding_grad = []
         train_mmdit_grad = []
         debug_shapes: dict[str, str] = {}
-        for batch in train_loader:
-            x = batch["x"].to(device)
-            text_emb = batch["text_emb"].to(device)
-            gaf = batch["gaf"].to(device)
+        for step_idx, batch in enumerate(train_loader):
+            x = batch["x"].to(device, non_blocking=True)
+            text_emb = batch["text_emb"].to(device, non_blocking=True)
+            gaf = batch["gaf"].to(device, non_blocking=True)
             semantic_atoms = _optional_to_device(batch, "semantic_atoms", device)
             loss, metrics = diffusion.training_loss(x, text_emb, gaf, semantic_atoms=semantic_atoms)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            gaf_encoder, grounding, mmdit = _debug_modules(diffusion)
-            train_gaf_encoder_grad.append(_module_grad_norm(gaf_encoder))
-            train_grounding_grad.append(_module_grad_norm(grounding))
-            train_mmdit_grad.append(_module_grad_norm(mmdit))
+            if grad_norm_every > 0 and step_idx % grad_norm_every == 0:
+                gaf_encoder, grounding, mmdit = _debug_modules(diffusion)
+                train_gaf_encoder_grad.append(_module_grad_norm(gaf_encoder))
+                train_grounding_grad.append(_module_grad_norm(grounding))
+                train_mmdit_grad.append(_module_grad_norm(mmdit))
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(diffusion.parameters(), grad_clip)
             optimizer.step()
@@ -306,28 +337,28 @@ def train(args: argparse.Namespace) -> None:
                     "debug_env_slots_shape": str(metrics.get("debug_env_slots_shape", "unknown")),
                     "debug_env_mix_shape": str(metrics.get("debug_env_mix_shape", "unknown")),
                 }
-            train_losses.append(float(loss.detach().cpu()))
-            train_loss_diff.append(float(metrics["loss_diff"].detach().cpu()))
-            train_loss_spectral.append(float(metrics["loss_spectral"].detach().cpu()))
-            train_loss_slot_aux.append(float(metrics["loss_slot_aux"].detach().cpu()))
-            train_loss_grounding_aux.append(float(metrics.get("loss_grounding_aux", torch.tensor(0.0, device=device)).detach().cpu()))
-            train_loss_cycle_relation.append(float(metrics.get("loss_cycle_relation", torch.tensor(0.0, device=device)).detach().cpu()))
-            train_loss_triad_contrastive.append(float(metrics.get("loss_triad_contrastive", torch.tensor(0.0, device=device)).detach().cpu()))
-            train_grounding_ot.append(float(metrics.get("grounding_loss_ot", torch.tensor(0.0, device=device)).detach().cpu()))
-            train_grounding_mask.append(float(metrics.get("grounding_loss_mask", torch.tensor(0.0, device=device)).detach().cpu()))
-            train_grounding_cycle.append(float(metrics.get("grounding_loss_cycle", torch.tensor(0.0, device=device)).detach().cpu()))
-            train_spectral_weight.append(float(metrics["spectral_weight"].detach().cpu()))
-            train_route_entropy.append(float(metrics["route_entropy"].detach().cpu()))
-            train_route_entropy_loss.append(float(metrics["route_entropy_loss"].detach().cpu()))
-            train_route_entropy_scale.append(float(metrics["route_entropy_scale"].detach().cpu()))
-            train_route_max.append(float(metrics["route_max"].detach().cpu()))
-            train_slot_diversity.append(float(metrics["slot_diversity_loss"].detach().cpu()))
-            train_text_slot_align.append(float(metrics["text_slot_align_loss"].detach().cpu()))
-            train_text_env_slot.append(float(metrics["text_env_slot_loss"].detach().cpu()))
-            train_slot_cosine.append(float(metrics["slot_cosine_mean"].detach().cpu()))
-            train_text_drop.append(float(metrics["text_drop_rate"].detach().cpu()))
-            train_env_drop.append(float(metrics["env_drop_rate"].detach().cpu()))
-            train_semantic_drop.append(float(metrics.get("semantic_drop_rate", torch.tensor(0.0, device=device)).detach().cpu()))
+            _record(train_losses, loss)
+            _record(train_loss_diff, metrics["loss_diff"])
+            _record(train_loss_spectral, metrics["loss_spectral"])
+            _record(train_loss_slot_aux, metrics["loss_slot_aux"])
+            _record(train_loss_grounding_aux, metrics.get("loss_grounding_aux", torch.tensor(0.0, device=device)))
+            _record(train_loss_cycle_relation, metrics.get("loss_cycle_relation", torch.tensor(0.0, device=device)))
+            _record(train_loss_triad_contrastive, metrics.get("loss_triad_contrastive", torch.tensor(0.0, device=device)))
+            _record(train_grounding_ot, metrics.get("grounding_loss_ot", torch.tensor(0.0, device=device)))
+            _record(train_grounding_mask, metrics.get("grounding_loss_mask", torch.tensor(0.0, device=device)))
+            _record(train_grounding_cycle, metrics.get("grounding_loss_cycle", torch.tensor(0.0, device=device)))
+            _record(train_spectral_weight, metrics["spectral_weight"])
+            _record(train_route_entropy, metrics["route_entropy"])
+            _record(train_route_entropy_loss, metrics["route_entropy_loss"])
+            _record(train_route_entropy_scale, metrics["route_entropy_scale"])
+            _record(train_route_max, metrics["route_max"])
+            _record(train_slot_diversity, metrics["slot_diversity_loss"])
+            _record(train_text_slot_align, metrics["text_slot_align_loss"])
+            _record(train_text_env_slot, metrics["text_env_slot_loss"])
+            _record(train_slot_cosine, metrics["slot_cosine_mean"])
+            _record(train_text_drop, metrics["text_drop_rate"])
+            _record(train_env_drop, metrics["env_drop_rate"])
+            _record(train_semantic_drop, metrics.get("semantic_drop_rate", torch.tensor(0.0, device=device)))
 
         diffusion.eval()
         val_losses = []
@@ -354,84 +385,84 @@ def train(args: argparse.Namespace) -> None:
         val_semantic_drop = []
         with torch.no_grad():
             for batch in valid_loader:
-                x = batch["x"].to(device)
-                text_emb = batch["text_emb"].to(device)
-                gaf = batch["gaf"].to(device)
+                x = batch["x"].to(device, non_blocking=True)
+                text_emb = batch["text_emb"].to(device, non_blocking=True)
+                gaf = batch["gaf"].to(device, non_blocking=True)
                 semantic_atoms = _optional_to_device(batch, "semantic_atoms", device)
                 loss, metrics = diffusion.training_loss(x, text_emb, gaf, semantic_atoms=semantic_atoms)
-                val_losses.append(float(loss.detach().cpu()))
-                val_loss_diff.append(float(metrics["loss_diff"].detach().cpu()))
-                val_loss_spectral.append(float(metrics["loss_spectral"].detach().cpu()))
-                val_loss_slot_aux.append(float(metrics["loss_slot_aux"].detach().cpu()))
-                val_loss_grounding_aux.append(float(metrics.get("loss_grounding_aux", torch.tensor(0.0, device=device)).detach().cpu()))
-                val_loss_cycle_relation.append(float(metrics.get("loss_cycle_relation", torch.tensor(0.0, device=device)).detach().cpu()))
-                val_loss_triad_contrastive.append(float(metrics.get("loss_triad_contrastive", torch.tensor(0.0, device=device)).detach().cpu()))
-                val_grounding_ot.append(float(metrics.get("grounding_loss_ot", torch.tensor(0.0, device=device)).detach().cpu()))
-                val_grounding_mask.append(float(metrics.get("grounding_loss_mask", torch.tensor(0.0, device=device)).detach().cpu()))
-                val_grounding_cycle.append(float(metrics.get("grounding_loss_cycle", torch.tensor(0.0, device=device)).detach().cpu()))
-                val_spectral_weight.append(float(metrics["spectral_weight"].detach().cpu()))
-                val_route_entropy.append(float(metrics["route_entropy"].detach().cpu()))
-                val_route_entropy_loss.append(float(metrics["route_entropy_loss"].detach().cpu()))
-                val_route_entropy_scale.append(float(metrics["route_entropy_scale"].detach().cpu()))
-                val_route_max.append(float(metrics["route_max"].detach().cpu()))
-                val_slot_diversity.append(float(metrics["slot_diversity_loss"].detach().cpu()))
-                val_text_slot_align.append(float(metrics["text_slot_align_loss"].detach().cpu()))
-                val_text_env_slot.append(float(metrics["text_env_slot_loss"].detach().cpu()))
-                val_slot_cosine.append(float(metrics["slot_cosine_mean"].detach().cpu()))
-                val_text_drop.append(float(metrics["text_drop_rate"].detach().cpu()))
-                val_env_drop.append(float(metrics["env_drop_rate"].detach().cpu()))
-                val_semantic_drop.append(float(metrics.get("semantic_drop_rate", torch.tensor(0.0, device=device)).detach().cpu()))
-        train_loss = float(np.mean(train_losses))
-        val_loss = float(np.mean(val_losses))
+                _record(val_losses, loss)
+                _record(val_loss_diff, metrics["loss_diff"])
+                _record(val_loss_spectral, metrics["loss_spectral"])
+                _record(val_loss_slot_aux, metrics["loss_slot_aux"])
+                _record(val_loss_grounding_aux, metrics.get("loss_grounding_aux", torch.tensor(0.0, device=device)))
+                _record(val_loss_cycle_relation, metrics.get("loss_cycle_relation", torch.tensor(0.0, device=device)))
+                _record(val_loss_triad_contrastive, metrics.get("loss_triad_contrastive", torch.tensor(0.0, device=device)))
+                _record(val_grounding_ot, metrics.get("grounding_loss_ot", torch.tensor(0.0, device=device)))
+                _record(val_grounding_mask, metrics.get("grounding_loss_mask", torch.tensor(0.0, device=device)))
+                _record(val_grounding_cycle, metrics.get("grounding_loss_cycle", torch.tensor(0.0, device=device)))
+                _record(val_spectral_weight, metrics["spectral_weight"])
+                _record(val_route_entropy, metrics["route_entropy"])
+                _record(val_route_entropy_loss, metrics["route_entropy_loss"])
+                _record(val_route_entropy_scale, metrics["route_entropy_scale"])
+                _record(val_route_max, metrics["route_max"])
+                _record(val_slot_diversity, metrics["slot_diversity_loss"])
+                _record(val_text_slot_align, metrics["text_slot_align_loss"])
+                _record(val_text_env_slot, metrics["text_env_slot_loss"])
+                _record(val_slot_cosine, metrics["slot_cosine_mean"])
+                _record(val_text_drop, metrics["text_drop_rate"])
+                _record(val_env_drop, metrics["env_drop_rate"])
+                _record(val_semantic_drop, metrics.get("semantic_drop_rate", torch.tensor(0.0, device=device)))
+        train_loss = _mean_scalar(train_losses)
+        val_loss = _mean_scalar(val_losses)
         row = {
             "epoch": epoch,
             "train_loss": train_loss,
             "val_loss": val_loss,
-            "train_loss_diff": float(np.mean(train_loss_diff)),
-            "train_loss_spectral": float(np.mean(train_loss_spectral)),
-            "train_loss_slot_aux": float(np.mean(train_loss_slot_aux)),
-            "train_loss_grounding_aux": float(np.mean(train_loss_grounding_aux)),
-            "train_loss_cycle_relation": float(np.mean(train_loss_cycle_relation)),
-            "train_loss_triad_contrastive": float(np.mean(train_loss_triad_contrastive)),
-            "train_grounding_loss_ot": float(np.mean(train_grounding_ot)),
-            "train_grounding_loss_mask": float(np.mean(train_grounding_mask)),
-            "train_grounding_loss_cycle": float(np.mean(train_grounding_cycle)),
-            "train_spectral_weight": float(np.mean(train_spectral_weight)),
-            "val_loss_diff": float(np.mean(val_loss_diff)),
-            "val_loss_spectral": float(np.mean(val_loss_spectral)),
-            "val_loss_slot_aux": float(np.mean(val_loss_slot_aux)),
-            "val_loss_grounding_aux": float(np.mean(val_loss_grounding_aux)),
-            "val_loss_cycle_relation": float(np.mean(val_loss_cycle_relation)),
-            "val_loss_triad_contrastive": float(np.mean(val_loss_triad_contrastive)),
-            "val_grounding_loss_ot": float(np.mean(val_grounding_ot)),
-            "val_grounding_loss_mask": float(np.mean(val_grounding_mask)),
-            "val_grounding_loss_cycle": float(np.mean(val_grounding_cycle)),
-            "val_spectral_weight": float(np.mean(val_spectral_weight)),
-            "train_route_entropy": float(np.mean(train_route_entropy)),
-            "train_route_entropy_loss": float(np.mean(train_route_entropy_loss)),
-            "train_route_entropy_scale": float(np.mean(train_route_entropy_scale)),
-            "train_route_max": float(np.mean(train_route_max)),
-            "train_slot_diversity_loss": float(np.mean(train_slot_diversity)),
-            "train_text_slot_align_loss": float(np.mean(train_text_slot_align)),
-            "train_text_env_slot_loss": float(np.mean(train_text_env_slot)),
-            "train_slot_cosine_mean": float(np.mean(train_slot_cosine)),
-            "val_route_entropy": float(np.mean(val_route_entropy)),
-            "val_route_entropy_loss": float(np.mean(val_route_entropy_loss)),
-            "val_route_entropy_scale": float(np.mean(val_route_entropy_scale)),
-            "val_route_max": float(np.mean(val_route_max)),
-            "val_slot_diversity_loss": float(np.mean(val_slot_diversity)),
-            "val_text_slot_align_loss": float(np.mean(val_text_slot_align)),
-            "val_text_env_slot_loss": float(np.mean(val_text_env_slot)),
-            "val_slot_cosine_mean": float(np.mean(val_slot_cosine)),
-            "train_text_drop_rate": float(np.mean(train_text_drop)),
-            "train_env_drop_rate": float(np.mean(train_env_drop)),
-            "train_semantic_drop_rate": float(np.mean(train_semantic_drop)),
-            "val_text_drop_rate": float(np.mean(val_text_drop)),
-            "val_env_drop_rate": float(np.mean(val_env_drop)),
-            "val_semantic_drop_rate": float(np.mean(val_semantic_drop)),
-            "train_gaf_encoder_grad_norm": float(np.mean(train_gaf_encoder_grad)),
-            "train_grounding_grad_norm": float(np.mean(train_grounding_grad)),
-            "train_mmdit_grad_norm": float(np.mean(train_mmdit_grad)),
+            "train_loss_diff": _mean_scalar(train_loss_diff),
+            "train_loss_spectral": _mean_scalar(train_loss_spectral),
+            "train_loss_slot_aux": _mean_scalar(train_loss_slot_aux),
+            "train_loss_grounding_aux": _mean_scalar(train_loss_grounding_aux),
+            "train_loss_cycle_relation": _mean_scalar(train_loss_cycle_relation),
+            "train_loss_triad_contrastive": _mean_scalar(train_loss_triad_contrastive),
+            "train_grounding_loss_ot": _mean_scalar(train_grounding_ot),
+            "train_grounding_loss_mask": _mean_scalar(train_grounding_mask),
+            "train_grounding_loss_cycle": _mean_scalar(train_grounding_cycle),
+            "train_spectral_weight": _mean_scalar(train_spectral_weight),
+            "val_loss_diff": _mean_scalar(val_loss_diff),
+            "val_loss_spectral": _mean_scalar(val_loss_spectral),
+            "val_loss_slot_aux": _mean_scalar(val_loss_slot_aux),
+            "val_loss_grounding_aux": _mean_scalar(val_loss_grounding_aux),
+            "val_loss_cycle_relation": _mean_scalar(val_loss_cycle_relation),
+            "val_loss_triad_contrastive": _mean_scalar(val_loss_triad_contrastive),
+            "val_grounding_loss_ot": _mean_scalar(val_grounding_ot),
+            "val_grounding_loss_mask": _mean_scalar(val_grounding_mask),
+            "val_grounding_loss_cycle": _mean_scalar(val_grounding_cycle),
+            "val_spectral_weight": _mean_scalar(val_spectral_weight),
+            "train_route_entropy": _mean_scalar(train_route_entropy),
+            "train_route_entropy_loss": _mean_scalar(train_route_entropy_loss),
+            "train_route_entropy_scale": _mean_scalar(train_route_entropy_scale),
+            "train_route_max": _mean_scalar(train_route_max),
+            "train_slot_diversity_loss": _mean_scalar(train_slot_diversity),
+            "train_text_slot_align_loss": _mean_scalar(train_text_slot_align),
+            "train_text_env_slot_loss": _mean_scalar(train_text_env_slot),
+            "train_slot_cosine_mean": _mean_scalar(train_slot_cosine),
+            "val_route_entropy": _mean_scalar(val_route_entropy),
+            "val_route_entropy_loss": _mean_scalar(val_route_entropy_loss),
+            "val_route_entropy_scale": _mean_scalar(val_route_entropy_scale),
+            "val_route_max": _mean_scalar(val_route_max),
+            "val_slot_diversity_loss": _mean_scalar(val_slot_diversity),
+            "val_text_slot_align_loss": _mean_scalar(val_text_slot_align),
+            "val_text_env_slot_loss": _mean_scalar(val_text_env_slot),
+            "val_slot_cosine_mean": _mean_scalar(val_slot_cosine),
+            "train_text_drop_rate": _mean_scalar(train_text_drop),
+            "train_env_drop_rate": _mean_scalar(train_env_drop),
+            "train_semantic_drop_rate": _mean_scalar(train_semantic_drop),
+            "val_text_drop_rate": _mean_scalar(val_text_drop),
+            "val_env_drop_rate": _mean_scalar(val_env_drop),
+            "val_semantic_drop_rate": _mean_scalar(val_semantic_drop),
+            "train_gaf_encoder_grad_norm": _mean_scalar(train_gaf_encoder_grad),
+            "train_grounding_grad_norm": _mean_scalar(train_grounding_grad),
+            "train_mmdit_grad_norm": _mean_scalar(train_mmdit_grad),
             **debug_shapes,
             "lr": float(optimizer.param_groups[0]["lr"]),
             "epoch_seconds": float(time.time() - epoch_start),

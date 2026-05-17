@@ -77,7 +77,8 @@ training:
   lr: 0.0002
   weight_decay: 0.01
   grad_clip: 1.0
-  num_workers: 0
+  num_workers: 4
+  grad_norm_every: 100
   save_every: 10
 
 evaluation:
