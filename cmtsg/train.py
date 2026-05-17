@@ -312,7 +312,7 @@ def train(args: argparse.Namespace) -> None:
     train_ds = CMTSGDataset(data_root, processed_root, "train", mean=mean, std=std, train=True, gaf_max_size=gaf_max_size)
     valid_ds = CMTSGDataset(data_root, processed_root, "valid", mean=mean, std=std, train=False, gaf_max_size=gaf_max_size)
     batch_size = int(args.batch_size or get_nested(cfg, "training.batch_size", 128))
-    num_workers = int(get_nested(cfg, "training.num_workers", 0))
+    num_workers = int(args.num_workers if args.num_workers is not None else get_nested(cfg, "training.num_workers", 0))
     log_every = int(args.log_every if args.log_every is not None else get_nested(cfg, "training.log_every", 50))
     val_log_every = int(args.val_log_every if args.val_log_every is not None else get_nested(cfg, "training.val_log_every", max(1, log_every)))
     pin_memory = _as_bool(args.pin_memory if args.pin_memory is not None else get_nested(cfg, "training.pin_memory", False))
@@ -321,10 +321,11 @@ def train(args: argparse.Namespace) -> None:
         if args.persistent_workers is not None
         else get_nested(cfg, "training.persistent_workers", False)
     )
-    prefetch_factor = int(get_nested(cfg, "training.prefetch_factor", 2))
+    prefetch_factor = int(args.prefetch_factor if args.prefetch_factor is not None else get_nested(cfg, "training.prefetch_factor", 2))
     valid_num_workers = int(args.valid_num_workers if args.valid_num_workers is not None else get_nested(cfg, "training.valid_num_workers", 0))
     save_every = int(get_nested(cfg, "training.save_every", 10))
     save_last_every = int(args.save_last_every if args.save_last_every is not None else get_nested(cfg, "training.save_last_every", save_every))
+    save_best_every = int(args.save_best_every if args.save_best_every is not None else get_nested(cfg, "training.save_best_every", 1))
     save_optimizer_every = int(args.save_optimizer_every if args.save_optimizer_every is not None else get_nested(cfg, "training.save_optimizer_every", save_every))
     save_optimizer_best = _as_bool(get_nested(cfg, "training.save_optimizer_best", False))
     save_optimizer_last = _as_bool(get_nested(cfg, "training.save_optimizer_last", False))
@@ -387,6 +388,7 @@ def train(args: argparse.Namespace) -> None:
             "prefetch_factor": prefetch_factor,
             "save_every": save_every,
             "save_last_every": save_last_every,
+            "save_best_every": save_best_every,
             "save_optimizer_every": save_optimizer_every,
             "validation_seed": validation_seed,
             "validation_mode": validation_mode,
@@ -428,7 +430,8 @@ def train(args: argparse.Namespace) -> None:
         f"valid_num_workers={valid_num_workers} "
         f"pin_memory={pin_memory} persistent_workers={persistent_workers} "
         f"prefetch_factor={prefetch_factor} "
-        f"save_last_every={save_last_every} save_optimizer_every={save_optimizer_every} "
+        f"save_last_every={save_last_every} save_best_every={save_best_every} "
+        f"save_optimizer_every={save_optimizer_every} "
         f"validation_mode={validation_mode} validation_seed={validation_seed} "
         f"train_gaf_cache={train_ds.gaf_cache is not None} "
         f"valid_gaf_cache={valid_ds.gaf_cache is not None}",
@@ -699,21 +702,28 @@ def train(args: argparse.Namespace) -> None:
             )
         if val_loss < best_val:
             best_val = val_loss
-            seconds = _save_checkpoint(
-                checkpoint_dir / "best.pt",
-                diffusion,
-                optimizer,
-                epoch,
-                cfg,
-                stats,
-                include_optimizer=save_optimizer_best,
-            )
-            saved_checkpoint = True
-            print(
-                f"epoch={epoch:04d} [DIAG] saved best.pt seconds={seconds:.2f} "
-                f"include_optimizer={save_optimizer_best}",
-                flush=True,
-            )
+            if save_best_every > 0 and epoch % save_best_every == 0:
+                seconds = _save_checkpoint(
+                    checkpoint_dir / "best.pt",
+                    diffusion,
+                    optimizer,
+                    epoch,
+                    cfg,
+                    stats,
+                    include_optimizer=save_optimizer_best,
+                )
+                saved_checkpoint = True
+                print(
+                    f"epoch={epoch:04d} [DIAG] saved best.pt seconds={seconds:.2f} "
+                    f"include_optimizer={save_optimizer_best}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"epoch={epoch:04d} [DIAG] best_val improved to {best_val:.6f}; "
+                    f"best.pt save deferred by save_best_every={save_best_every}",
+                    flush=True,
+                )
         if save_every > 0 and epoch % save_every == 0:
             include_optimizer = save_optimizer_every > 0 and epoch % save_optimizer_every == 0
             seconds = _save_checkpoint(
@@ -875,6 +885,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--prefetch-factor", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--sample-after-train", action="store_true")
     parser.add_argument("--sample-count", type=int, default=16)
@@ -887,6 +899,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--persistent-workers", dest="persistent_workers", action="store_true", default=None)
     parser.add_argument("--no-persistent-workers", dest="persistent_workers", action="store_false")
     parser.add_argument("--save-last-every", type=int, default=None)
+    parser.add_argument("--save-best-every", type=int, default=None)
     parser.add_argument("--save-optimizer-every", type=int, default=None)
     parser.add_argument("--validation-mode", choices=["main", "full"], default=None)
     return parser
