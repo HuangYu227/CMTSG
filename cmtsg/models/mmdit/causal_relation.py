@@ -7,6 +7,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from cmtsg.models.dit import FinalLayer, PatchEmbed1D, TimestepEmbedder, modulate
+from cmtsg.models.grounding import CausalSemanticGrounding
 
 
 class MultiHeadRMSNorm(nn.Module):
@@ -80,6 +81,12 @@ class TriModalJointAttention(nn.Module):
         self.qk_rmsnorm = qk_rmsnorm
         self.q_norms = nn.ModuleList([MultiHeadRMSNorm(self.dim_head, num_heads) for _ in dim_modalities])
         self.k_norms = nn.ModuleList([MultiHeadRMSNorm(self.dim_head, num_heads) for _ in dim_modalities])
+        self.relation_pair_bias = nn.Sequential(
+            nn.LayerNorm(dim_modalities[2]),
+            nn.Linear(dim_modalities[2], num_heads * len(dim_modalities) * len(dim_modalities)),
+        )
+        nn.init.zeros_(self.relation_pair_bias[-1].weight)
+        nn.init.zeros_(self.relation_pair_bias[-1].bias)
 
     def _project(self, x: torch.Tensor, proj: nn.Linear, q_norm: nn.Module, k_norm: nn.Module) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, n_tokens, _ = x.shape
@@ -108,6 +115,18 @@ class TriModalJointAttention(nn.Module):
         v = torch.cat([item[2] for item in qkv], dim=2)
 
         attn_logits = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        pair_bias = self.relation_pair_bias(inputs[2].mean(dim=1))
+        pair_bias = pair_bias.reshape(inputs[0].shape[0], self.num_heads, len(inputs), len(inputs))
+        q_start = 0
+        for q_idx, q_len in enumerate(lengths):
+            k_start = 0
+            for k_idx, k_len in enumerate(lengths):
+                attn_logits[:, :, q_start : q_start + q_len, k_start : k_start + k_len] = (
+                    attn_logits[:, :, q_start : q_start + q_len, k_start : k_start + k_len]
+                    + pair_bias[:, :, q_idx, k_idx][:, :, None, None]
+                )
+                k_start += k_len
+            q_start += q_len
         if self.softclamp:
             attn_logits = (attn_logits / self.softclamp_value).tanh() * self.softclamp_value
         packed_masks = []
@@ -196,11 +215,30 @@ class SemanticTokenAdapter(nn.Module):
             nn.LayerNorm(text_dim),
             nn.Linear(text_dim, hidden_size * num_tokens),
         )
+        self.atom_proj = nn.Sequential(
+            nn.LayerNorm(text_dim),
+            nn.Linear(text_dim, hidden_size),
+        )
         self.token_type = nn.Parameter(torch.randn(1, num_tokens, hidden_size) * 0.02)
 
     def forward(self, text_emb: torch.Tensor) -> torch.Tensor:
-        tokens = self.token_proj(text_emb).reshape(text_emb.shape[0], self.num_tokens, -1)
-        return tokens + self.token_type.to(device=text_emb.device, dtype=text_emb.dtype)
+        if text_emb.ndim == 2:
+            tokens = self.token_proj(text_emb).reshape(text_emb.shape[0], self.num_tokens, -1)
+        elif text_emb.ndim == 3:
+            tokens = self.atom_proj(text_emb)
+        else:
+            raise ValueError(f"Expected text embedding [B,D] or atom embeddings [B,C,D], got {tuple(text_emb.shape)}")
+        token_type = self.token_type.to(device=tokens.device, dtype=tokens.dtype)
+        if tokens.shape[1] <= token_type.shape[1]:
+            token_type = token_type[:, : tokens.shape[1]]
+        else:
+            token_type = F.interpolate(
+                token_type.transpose(1, 2),
+                size=tokens.shape[1],
+                mode="linear",
+                align_corners=False,
+            ).transpose(1, 2)
+        return tokens + token_type
 
 
 class SeriesRegisterResampler(nn.Module):
@@ -350,11 +388,17 @@ class CausalRelationMMDiTDenoiser(nn.Module):
         dim_head: int | None = None,
         qk_rmsnorm: bool = True,
         softclamp: bool = True,
+        use_semantic_grounding: bool = True,
+        grounding_num_heads: int = 4,
+        grounding_sinkhorn_iters: int = 24,
+        grounding_ot_temperature: float = 0.07,
+        grounding_mask_temperature: float = 1.0,
     ) -> None:
         super().__init__()
         self.seq_len = seq_len
         self.n_vars = n_vars
         self.patch_size = patch_size
+        self.use_semantic_grounding = use_semantic_grounding
         self.x_embedder = PatchEmbed1D(n_vars, patch_size, hidden_size)
         self.pos_embedder = FrequencyLagPositionalEncoding(seq_len, n_vars, patch_size, hidden_size)
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -365,6 +409,16 @@ class CausalRelationMMDiTDenoiser(nn.Module):
         )
         self.semantic_adapter = SemanticTokenAdapter(text_dim, hidden_size, text_tokens)
         self.relation_proj = nn.Sequential(nn.LayerNorm(env_dim), nn.Linear(env_dim, hidden_size))
+        if use_semantic_grounding:
+            self.semantic_grounding = CausalSemanticGrounding(
+                dim=hidden_size,
+                num_heads=grounding_num_heads,
+                sinkhorn_iters=grounding_sinkhorn_iters,
+                ot_temperature=grounding_ot_temperature,
+                mask_temperature=grounding_mask_temperature,
+            )
+        else:
+            self.semantic_grounding = None
         self.blocks = nn.ModuleList(
             [
                 TriModalMMDiTBlock(
@@ -407,6 +461,18 @@ class CausalRelationMMDiTDenoiser(nn.Module):
         semantic_tokens = self.semantic_adapter(text_emb if semantic_text_emb is None else semantic_text_emb)
         relation_tokens = self.relation_proj(env_tokens)
         series_registers = None
+        grounding_outputs: dict[str, torch.Tensor] = {}
+        grounding_losses: dict[str, torch.Tensor] = {}
+
+        if self.semantic_grounding is not None:
+            grounding_features = series_tokens.permute(0, 3, 1, 2).contiguous()
+            grounding_outputs, grounding_losses = self.semantic_grounding(
+                semantic_tokens,
+                relation_tokens,
+                grounding_features,
+            )
+            semantic_tokens = grounding_outputs["semantic_atoms"]
+            relation_tokens = grounding_outputs["relation_slots"]
 
         for block in self.blocks:
             series_tokens, series_registers, semantic_tokens, relation_tokens = block(
@@ -433,4 +499,15 @@ class CausalRelationMMDiTDenoiser(nn.Module):
             "semantic_summary": self.semantic_summary_norm(semantic_tokens.mean(dim=1)),
             "relation_summary": self.relation_summary_norm(relation_tokens.mean(dim=1)),
         }
+        if grounding_losses:
+            aux.update(
+                {
+                    "grounding_loss_ot": grounding_losses["loss_ot"],
+                    "grounding_loss_mask": grounding_losses["loss_ground"],
+                    "grounding_loss_cycle": grounding_losses["loss_cycle"],
+                    "grounding_transport_entropy": grounding_losses["transport_entropy"],
+                    "grounding_transport_row_error": grounding_losses["transport_row_error"],
+                    "grounding_transport_col_error": grounding_losses["transport_col_error"],
+                }
+            )
         return out, aux

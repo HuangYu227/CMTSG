@@ -52,9 +52,21 @@ def save_json(obj: Any, path: str | Path) -> None:
 
 
 def normalize_dataset_name(name: str) -> str:
-    lowered = name.lower().replace("_", "-")
+    lowered = str(name).strip().lower().replace("_", "-")
     if lowered in {"weather", "weather datasets"}:
         return "weather"
     if lowered in {"synth-m", "synth-multi", "synthetic-m", "synthetic_m"}:
         return "synth-m"
-    raise ValueError(f"Unsupported dataset: {name}")
+    normalized = []
+    previous_dash = False
+    for char in lowered:
+        if char.isalnum() or char == ".":
+            normalized.append(char)
+            previous_dash = False
+        elif char in {"-", " ", "/", "\\"} and not previous_dash:
+            normalized.append("-")
+            previous_dash = True
+    dataset = "".join(normalized).strip("-")
+    if not dataset:
+        raise ValueError(f"Invalid dataset name: {name!r}")
+    return dataset

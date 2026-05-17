@@ -1,3 +1,6 @@
+
+
+
 from __future__ import annotations
 
 import argparse
@@ -114,7 +117,7 @@ def run(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Encode causal_text.npy with LongCLIP.")
-    parser.add_argument("--dataset", required=True, choices=["weather", "synth-m"])
+    parser.add_argument("--dataset", required=True)
     parser.add_argument("--split", required=True, choices=["train", "valid", "test"])
     parser.add_argument("--source", choices=["causal", "original"], default="causal")
     parser.add_argument("--data-root", default=None)

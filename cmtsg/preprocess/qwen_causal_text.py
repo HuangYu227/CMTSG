@@ -53,11 +53,12 @@ def _generation_condition(obj: dict[str, Any], fallback: str) -> str:
 
 
 def _mock_json(dataset: str, caption: str) -> dict[str, Any]:
+
     sentence = caption.strip().split(".")[0].strip()
     if not sentence:
         sentence = "The time series follows the described generation condition"
     return {
-        "dataset": "Weather" if dataset == "weather" else "Synth-M",
+        "dataset": dataset.replace("-", " ").title(),
         "chart_consistency": {"is_consistent_with_text": "unclear", "evidence": "mock output"},
         "generation_condition": sentence + ".",
     }
@@ -246,7 +247,7 @@ def run(args: argparse.Namespace) -> None:
                     fallback_condition = _generation_condition_from_raw(raw)
                     if args.allow_partial_json and fallback_condition:
                         obj = {
-                            "dataset": "Weather" if dataset == "weather" else "Synth-M",
+                            "dataset": dataset.replace("-", " ").title(),
                             "generation_condition": fallback_condition,
                             "parse_warning": f"partial_json_fallback: {type(exc).__name__}: {exc}",
                         }
@@ -256,7 +257,7 @@ def run(args: argparse.Namespace) -> None:
                     if args.fallback_to_caption:
                         fallback = caption.strip()
                         obj = {
-                            "dataset": "Weather" if dataset == "weather" else "Synth-M",
+                            "dataset": dataset.replace("-", " ").title(),
                             "generation_condition": fallback,
                             "parse_warning": f"caption_fallback: {type(exc).__name__}: {exc}",
                         }
@@ -301,7 +302,7 @@ def run(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Extract causal generation text with Qwen2.5-VL.")
-    parser.add_argument("--dataset", required=True, choices=["weather", "synth-m"])
+    parser.add_argument("--dataset", required=True)
     parser.add_argument("--split", required=True, choices=["train", "valid", "test"])
     parser.add_argument("--data-root", default=None)
     parser.add_argument("--processed-root", default=None)

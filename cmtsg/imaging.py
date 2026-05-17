@@ -1,3 +1,8 @@
+"""
+this module implements the imaging functions for time series data, including PAA, min-max scaling, 
+and Gramian Angular Fields (GAF/GADF).
+"""
+
 from __future__ import annotations
 
 from typing import Literal
@@ -8,6 +13,9 @@ import numpy as np
 GafKind = Literal["GASF", "GADF"]
 
 def paa_1d(series: np.ndarray, output_size: int) -> np.ndarray:
+    """
+    Piecewise Aggregate Approximation (PAA) for 1D time series. max: 384
+    """
     values = np.asarray(series, dtype=np.float32)
     if values.ndim != 1:
         raise ValueError(f"PAA expects 1D input, got {values.shape}")
@@ -29,6 +37,9 @@ def paa_1d(series: np.ndarray, output_size: int) -> np.ndarray:
 
 
 def minmax_scale_1d(series: np.ndarray) -> np.ndarray:
+    """
+    (x - min) / (max - min)
+    """
     values = np.asarray(series, dtype=np.float32)
     span = float(values.max() - values.min())
     if span < 1e-12:
@@ -55,6 +66,11 @@ def gramian_angular_field(series: np.ndarray, kind: GafKind = "GASF") -> np.ndar
 
 
 def gasf_multivariate(sample: np.ndarray, max_size: int = 384) -> np.ndarray:
+    """
+    values shape: [L, K] -> images shape: [K, max_size, max_size]
+    defalut GADF
+    let values shape be [L, K], then we will get K data images, each of shape [max_size, max_size].
+    """
     values = np.asarray(sample, dtype=np.float32)
     if values.ndim == 1:
         values = values[:, None]
@@ -72,6 +88,10 @@ def gasf_multivariate(sample: np.ndarray, max_size: int = 384) -> np.ndarray:
 
 
 def chart_stats(sample: np.ndarray) -> dict[str, object]:
+    """
+    llm may find it easier to understand the chart if we provide some statistics about the time series data.
+    This function computes some basic statistics that can be included in the prompt.
+    """
     values = np.asarray(sample, dtype=np.float32)
     if values.ndim == 1:
         values = values[:, None]

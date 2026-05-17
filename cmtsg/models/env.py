@@ -80,6 +80,51 @@ class GAFDepthwisePointwiseEncoder(nn.Module):
         return tokens, tokens.mean(dim=1)
 
 
+class DirectedVariableGraphBlock(nn.Module):
+    def __init__(self, dim: int, num_heads: int = 4, mlp_ratio: float = 2.0, dropout: float = 0.0) -> None:
+        super().__init__()
+        if dim % num_heads != 0:
+            num_heads = 1
+        self.num_heads = num_heads
+        self.dim_head = dim // num_heads
+        self.scale = self.dim_head**-0.5
+        self.norm_targets = nn.LayerNorm(dim)
+        self.norm_sources = nn.LayerNorm(dim)
+        self.to_target_q = nn.Linear(dim, dim, bias=False)
+        self.to_source_kv = nn.Linear(dim, dim * 2, bias=False)
+        self.to_out = nn.Sequential(nn.Linear(dim, dim), nn.Dropout(dropout))
+        self.norm_ff = nn.LayerNorm(dim)
+        hidden = int(dim * mlp_ratio)
+        self.ff = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, dim),
+            nn.Dropout(dropout),
+        )
+        self.graph_gate = nn.Parameter(torch.tensor(0.0))
+        self.ff_gate = nn.Parameter(torch.tensor(0.0))
+
+    def _heads(self, x: torch.Tensor) -> torch.Tensor:
+        bsz, n_vars, _ = x.shape
+        return x.reshape(bsz, n_vars, self.num_heads, self.dim_head).transpose(1, 2)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        target_q = self._heads(self.to_target_q(self.norm_targets(x)))
+        source_k, source_v = self.to_source_kv(self.norm_sources(x)).chunk(2, dim=-1)
+        source_k = self._heads(source_k)
+        source_v = self._heads(source_v)
+        logits = torch.matmul(target_q, source_k.transpose(-1, -2)) * self.scale
+        if x.shape[1] > 1:
+            eye = torch.eye(x.shape[1], device=x.device, dtype=torch.bool)
+            logits = logits.masked_fill(eye[None, None], -torch.finfo(logits.dtype).max)
+        graph = logits.softmax(dim=-1)
+        message = torch.matmul(graph, source_v).transpose(1, 2).reshape_as(x)
+        x = x + torch.tanh(self.graph_gate) * self.to_out(message)
+        x = x + torch.tanh(self.ff_gate) * self.ff(self.norm_ff(x))
+        return x, graph
+
+
 class GADFRelationSlotEncoder(nn.Module):
     def __init__(
         self,
@@ -119,6 +164,7 @@ class GADFRelationSlotEncoder(nn.Module):
             ),
             num_layers=1,
         )
+        self.variable_graph = DirectedVariableGraphBlock(output_dim, num_heads=heads)
         self.slot_queries = nn.Parameter(torch.randn(n_env, output_dim) * 0.02)
         self.slot_pool = nn.MultiheadAttention(output_dim, heads, batch_first=True)
         self.slot_norm = nn.LayerNorm(output_dim)
@@ -132,6 +178,7 @@ class GADFRelationSlotEncoder(nn.Module):
     def forward(self, gaf: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         env_tokens_raw, _ = self.local_encoder(gaf)
         env_tokens = self.variable_mixer(env_tokens_raw)
+        env_tokens, _ = self.variable_graph(env_tokens)
         queries = self.slot_queries.to(device=env_tokens.device, dtype=env_tokens.dtype)
         queries = queries.unsqueeze(0).expand(env_tokens.shape[0], -1, -1)
         pooled, _ = self.slot_pool(queries, env_tokens, env_tokens, need_weights=False)
@@ -270,8 +317,11 @@ class EnvironmentRouter(nn.Module):
             alpha, query, _ = self._route_slots(text_emb, env_slots)
             env_mix = torch.einsum("bn,bnd->bd", alpha, env_slots)
             router_aux = self._slot_aux_losses(env_slots, alpha, query, env_mix)
+            text_alpha, _, _ = self._route_slots(text_emb, text_env_slots)
+            text_env_mix = torch.einsum("bn,bnd->bd", text_alpha, text_env_slots)
             text_slot_cos = F.cosine_similarity(text_env_slots, env_slots.detach(), dim=-1)
-            router_aux["text_env_slot_loss"] = 1.0 - text_slot_cos.mean()
+            text_mix_cos = F.cosine_similarity(text_env_mix, env_mix.detach(), dim=-1)
+            router_aux["text_env_slot_loss"] = 0.5 * ((1.0 - text_slot_cos.mean()) + (1.0 - text_mix_cos.mean()))
             return env_mix, alpha, env_raw, env_slots, router_aux
 
         if self.learned_env_raw is None:

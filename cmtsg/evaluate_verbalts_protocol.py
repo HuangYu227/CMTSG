@@ -81,6 +81,43 @@ def _load_condition_embeddings(processed_root: Path, split: str, policy: str, se
     return emb[np.arange(emb.shape[0]), indices], indices
 
 
+def _load_semantic_atoms(processed_root: Path, split: str, base_embeddings: np.ndarray, max_eval_samples: int | None) -> np.ndarray | None:
+    path = processed_root / f"{split}_semantic_atoms.npy"
+    if path.exists():
+        atoms = np.load(path).astype(np.float32)
+        if atoms.ndim == 2:
+            atoms = atoms[:, None, :]
+        if atoms.ndim != 3:
+            raise ValueError(f"Expected semantic atoms [N,C,D], got {atoms.shape}")
+    elif base_embeddings.ndim == 3 and base_embeddings.shape[1] > 1:
+        atoms = base_embeddings.astype(np.float32)
+    else:
+        return None
+    if max_eval_samples is not None:
+        atoms = atoms[:max_eval_samples]
+    return atoms
+
+
+def _build_gaf_indices(total: int, mode: str, seed: int) -> np.ndarray | None:
+    if mode in {"real", "none"}:
+        return None
+    rng = np.random.default_rng(seed)
+    if mode == "shuffle":
+        indices = rng.permutation(total)
+        if total > 1:
+            fixed = indices == np.arange(total)
+            if fixed.any():
+                indices[fixed] = np.roll(indices, 1)[fixed]
+        return indices.astype(np.int64)
+    if mode == "random":
+        indices = rng.integers(0, total, size=total, dtype=np.int64)
+        if total > 1:
+            fixed = indices == np.arange(total)
+            indices[fixed] = (indices[fixed] + 1) % total
+        return indices
+    raise ValueError(f"Unsupported gaf_mode: {mode}")
+
+
 @torch.no_grad()
 def _generate_median(
     diffusion,
@@ -95,20 +132,32 @@ def _generate_median(
     n_samples: int,
     sampler: str,
     device: torch.device,
-    use_gaf_condition: bool,
+    gaf_mode: str,
+    gaf_seed: int,
+    semantic_atoms: np.ndarray | None,
 ) -> np.ndarray:
     preds = []
+    gaf_indices = _build_gaf_indices(text_emb.shape[0], gaf_mode, gaf_seed)
     for start in tqdm(range(0, text_emb.shape[0], batch_size), desc="generate"):
         end = start + batch_size
         emb = torch.from_numpy(text_emb[start:end]).to(device)
-        if use_gaf_condition:
+        sem = torch.from_numpy(semantic_atoms[start:end]).to(device) if semantic_atoms is not None else None
+        if gaf_mode == "none":
+            gaf = None
+        elif gaf_mode == "real":
             gaf_np = np.stack([gasf_multivariate(sample, max_size=gaf_max_size) for sample in eval_ts[start:end]], axis=0)
             gaf = torch.from_numpy(gaf_np).to(device)
         else:
-            gaf = None
+            if gaf_indices is None:
+                raise RuntimeError(f"Internal GAF index error for mode={gaf_mode}")
+            gaf_np = np.stack(
+                [gasf_multivariate(eval_ts[int(gaf_indices[idx])], max_size=gaf_max_size) for idx in range(start, end)],
+                axis=0,
+            )
+            gaf = torch.from_numpy(gaf_np).to(device)
         sample_preds = []
         for _ in range(n_samples):
-            gen_norm = diffusion.sample((emb.shape[0], seq_len, n_vars), emb, gaf, sampler=sampler)
+            gen_norm = diffusion.sample((emb.shape[0], seq_len, n_vars), emb, gaf, sampler=sampler, semantic_atoms=sem)
             sample_preds.append(gen_norm.cpu().numpy() * std + mean)
         preds.append(np.median(np.stack(sample_preds, axis=0), axis=0))
     return np.concatenate(preds, axis=0).astype(np.float32)
@@ -151,12 +200,19 @@ def run(args: argparse.Namespace) -> None:
     diffusion.load_state_dict(checkpoint["model"])
     diffusion.eval()
 
+    emb_path = processed_root / f"{args.split}_text_emb.npy"
+    all_condition_embeddings = np.load(emb_path).astype(np.float32)
+    if all_condition_embeddings.ndim == 2:
+        all_condition_embeddings = all_condition_embeddings[:, None, :]
     text_emb, condition_indices = _load_condition_embeddings(processed_root, args.split, args.condition_policy, args.condition_seed)
     if args.max_eval_samples is not None:
         text_emb = text_emb[: args.max_eval_samples]
         condition_indices = condition_indices[: args.max_eval_samples]
+        all_condition_embeddings = all_condition_embeddings[: args.max_eval_samples]
+    semantic_atoms = _load_semantic_atoms(processed_root, args.split, all_condition_embeddings, args.max_eval_samples)
     objective = str(cfg.get("diffusion", {}).get("objective", "rectified_flow")).lower()
     sampler = args.sampler or ("heun" if objective in {"rectified_flow", "flow", "flow_matching"} else "ddim")
+    gaf_mode = args.gaf_mode or ("none" if args.text_only_sampling else "real")
     gen = _generate_median(
         diffusion,
         eval_ts,
@@ -170,7 +226,9 @@ def run(args: argparse.Namespace) -> None:
         args.n_samples,
         sampler,
         device,
-        not args.text_only_sampling,
+        gaf_mode,
+        args.gaf_seed,
+        semantic_atoms,
     )
 
     if args.save_pred:
@@ -220,6 +278,8 @@ def run(args: argparse.Namespace) -> None:
         "split": args.split,
         "sampler": sampler,
         "text_only_sampling": bool(args.text_only_sampling),
+        "gaf_mode": gaf_mode,
+        "gaf_seed": int(args.gaf_seed),
         "n_samples": args.n_samples,
         "batch_size": args.batch_size,
         "num_eval": int(gen.shape[0]),
@@ -254,6 +314,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-samples", type=int, default=10)
     parser.add_argument("--sampler", choices=["ddim", "ddpm", "euler", "heun"], default=None)
     parser.add_argument("--text-only-sampling", action="store_true", help="Do not condition generation on evaluation time-series GADF.")
+    parser.add_argument("--gaf-mode", choices=["real", "none", "shuffle", "random"], default=None)
+    parser.add_argument("--gaf-seed", type=int, default=123)
     parser.add_argument("--condition-policy", default="first", help="first, random, or a numeric cached embedding index.")
     parser.add_argument("--condition-seed", type=int, default=42)
     parser.add_argument("--metric-caption-source", choices=["original", "causal"], default="original")

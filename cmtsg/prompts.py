@@ -35,7 +35,16 @@ def load_prompt_template(dataset: str, path: str | Path | None = None) -> str:
         return _extract_block(text, "The dataset is Weather")
     if dataset == "synth-m":
         return _extract_block(text, "The dataset is Synth-M")
-    raise ValueError(f"Unsupported dataset: {dataset}")
+    if "{text_info}" in text:
+        return text
+    return (
+        "System: You are a causal mechanism extractor for multivariate time-series generation.\n"
+        "Use the natural-language condition as the primary source and the chart statistics as support. "
+        "Return valid JSON only, with exactly one key: generation_condition.\n\n"
+        "[Original Text Description]\n{text_info}\n\n"
+        "[Optional Chart Statistics]\n{chart_stats}\n\n"
+        'Return format: {"generation_condition": "..."}'
+    )
 
 
 def fill_prompt(template: str, text_info: str, chart_stats: str = "") -> str:
@@ -58,8 +67,9 @@ def compact_generation_condition_prompt(dataset: str, text_info: str, chart_stat
             f"[Optional Chart Statistics]\n{chart_stats}\n\n"
             'Return format: {"generation_condition": "..."}'
         )
+    dataset_label = dataset.replace("-", " ").title()
     return (
-        "You are a causal mechanism extractor for synthetic multivariate time-series generation.\n"
+        f"You are a causal mechanism extractor for {dataset_label} multivariate time-series generation.\n"
         "Use the text as the primary source and the chart only as visual verification.\n"
         "Return valid JSON only, with exactly one key: generation_condition.\n"
         "The value must be one concise English sentence describing the causal generation mechanism.\n\n"

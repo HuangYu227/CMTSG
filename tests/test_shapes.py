@@ -42,26 +42,48 @@ def main() -> None:
     x = torch.randn(4, 36, 5)
     t = torch.randint(0, 50, (4,))
     text = torch.randn(4, 64)
-    pred, aux = model(x, t, text, gaf)
+    semantic_atoms = torch.randn(4, 6, 64)
+    pred, aux = model(x, t, text, gaf, semantic_atoms=semantic_atoms)
     assert pred.shape == x.shape
     assert aux["alpha"].shape == (4, model.n_env)
     assert aux["env_slots"].shape == (4, model.n_env, model.env_dim)
     assert aux["series_summary"].shape == (4, 64)
     assert aux["semantic_summary"].shape == (4, 64)
     assert aux["relation_summary"].shape == (4, 64)
+    assert aux["grounding_aux_loss"].ndim == 0
+    assert aux["grounding_loss_ot"].ndim == 0
+    assert torch.isfinite(aux["grounding_aux_loss"])
     assert torch.allclose(aux["alpha"].sum(dim=-1), torch.ones(4), atol=1e-5)
     assert model.router.output_dim == 64 * 4 * 4
-    pred_cfg, _ = model(x, t, text, gaf, force_drop_text=True, force_drop_env=True, force_drop_semantic=True)
+    pred_cfg, _ = model(
+        x,
+        t,
+        text,
+        gaf,
+        semantic_atoms=semantic_atoms,
+        force_drop_text=True,
+        force_drop_env=True,
+        force_drop_semantic=True,
+    )
     assert pred_cfg.shape == x.shape
 
     flow = RectifiedFlow(model, num_steps=4, lambda_spectral=0.01, lambda_cycle_relation=0.01, lambda_triad_contrastive=0.01)
-    flow_loss, flow_metrics = flow.training_loss(x, text, gaf)
+    flow_loss, flow_metrics = flow.training_loss(x, text, gaf, semantic_atoms=semantic_atoms)
     assert flow_loss.ndim == 0
     assert torch.isfinite(flow_loss)
     assert "loss_flow" in flow_metrics
     assert "loss_cycle_relation" in flow_metrics
     assert "loss_triad_contrastive" in flow_metrics
-    flow_sample = flow.sample((4, 36, 5), text, gaf=None, sampler="heun", guidance_text=1.0, guidance_relation=1.0, guidance_joint=1.0)
+    flow_sample = flow.sample(
+        (4, 36, 5),
+        text,
+        gaf=None,
+        sampler="heun",
+        semantic_atoms=semantic_atoms,
+        guidance_text=1.0,
+        guidance_relation=1.0,
+        guidance_joint=1.0,
+    )
     assert flow_sample.shape == x.shape
 
     baseline_model = CMTSGModel(
@@ -75,14 +97,15 @@ def main() -> None:
         architecture="factorized_dit",
     )
     diffusion = GaussianDiffusion(model, num_steps=10)
-    loss, metrics = diffusion.training_loss(x, text, gaf)
+    loss, metrics = diffusion.training_loss(x, text, gaf, semantic_atoms=semantic_atoms)
     assert loss.ndim == 0
     assert "route_entropy" in metrics
     assert "loss_slot_aux" in metrics
+    assert "loss_grounding_aux" in metrics
     assert "slot_cosine_mean" in metrics
     assert "text_env_slot_loss" in metrics
     assert "route_entropy_scale" in metrics
-    text_only = diffusion.sample((4, 36, 5), text, gaf=None, sampler="ddim")
+    text_only = diffusion.sample((4, 36, 5), text, gaf=None, sampler="ddim", semantic_atoms=semantic_atoms)
     assert text_only.shape == x.shape
     baseline_diffusion = GaussianDiffusion(baseline_model, num_steps=10)
     baseline_loss, _ = baseline_diffusion.training_loss(x, text, gaf)

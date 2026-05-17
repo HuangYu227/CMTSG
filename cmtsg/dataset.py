@@ -48,6 +48,7 @@ class CMTSGDataset(Dataset):
             raise ValueError(f"Embedding count mismatch: {self.text_emb.shape} vs {self.ts.shape}")
         if self.text_emb.shape[1] not in (1, self.caps.shape[1]):
             raise ValueError(f"Caption count mismatch: {self.text_emb.shape} vs {self.caps.shape}")
+        self.semantic_atoms = self._load_semantic_atoms()
 
         self.mean = mean if mean is not None else self.ts.mean(axis=(0, 1), keepdims=True)
         self.std = std if std is not None else self.ts.std(axis=(0, 1), keepdims=True) + 1e-6
@@ -57,14 +58,43 @@ class CMTSGDataset(Dataset):
     def __len__(self) -> int:
         return int(self.ts.shape[0])
 
+    def _load_semantic_atoms(self) -> np.ndarray | None:
+        """
+        Optional token-level causal atom embeddings.
+
+        Preferred file convention:
+            processed_root/{split}_semantic_atoms.npy -> [N,C,D] or [N,D]
+
+        Backward-compatible fallback:
+            if split_text_emb.npy already contains multiple embeddings per sample
+            ([N,C,D], C > 1), use the whole set as semantic atoms instead of
+            throwing away token-level information through random caption choice.
+        """
+        atom_path = self.processed_root / f"{self.split}_semantic_atoms.npy"
+        if atom_path.exists():
+            atoms = np.load(atom_path).astype(np.float32)
+            if atoms.ndim == 2:
+                atoms = atoms[:, None, :]
+            if atoms.ndim != 3:
+                raise ValueError(f"Expected semantic atoms [N,C,D], got {atoms.shape}")
+            if atoms.shape[0] != self.ts.shape[0]:
+                raise ValueError(f"Semantic atom count mismatch: {atoms.shape} vs {self.ts.shape}")
+            return atoms
+        if self.text_emb.shape[1] > 1:
+            return self.text_emb
+        return None
+
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         if self.train:
             cap_idx = np.random.randint(0, self.text_emb.shape[1])
         else:
             cap_idx = 0
-        return {
+        item = {
             "x": torch.from_numpy(self.ts_norm[idx]).float(),
             "gaf": torch.from_numpy(gasf_multivariate(self.ts[idx], max_size=self.gaf_max_size)).float(),
             "text_emb": torch.from_numpy(self.text_emb[idx, cap_idx]).float(),
             "caption_index": torch.tensor(cap_idx, dtype=torch.long),
         }
+        if self.semantic_atoms is not None:
+            item["semantic_atoms"] = torch.from_numpy(self.semantic_atoms[idx]).float()
+        return item

@@ -32,10 +32,18 @@ model:
   mlp_ratio: 4.0
   patch_size: 4
   dropout: 0.1
-  text_tokens: 4
+  text_tokens: 6
   series_register_tokens: 64
   qk_rmsnorm: true
   softclamp: true
+  use_semantic_grounding: true
+  grounding_num_heads: 4
+  grounding_sinkhorn_iters: 24
+  grounding_ot_temperature: 0.07
+  grounding_mask_temperature: 1.0
+  grounding_ot_weight: 0.01
+  grounding_mask_weight: 0.01
+  grounding_cycle_weight: 0.01
   n_env: 12
   env_dim: 64
   env_slot_mode: dynamic_gaf

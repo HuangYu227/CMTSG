@@ -150,23 +150,36 @@ class GaussianDiffusion(nn.Module):
         )
 
     @staticmethod
-    def _validate_condition_batch(batch_size: int, text_emb: torch.Tensor, gaf: torch.Tensor | None = None) -> None:
+    def _validate_condition_batch(
+        batch_size: int,
+        text_emb: torch.Tensor,
+        gaf: torch.Tensor | None = None,
+        semantic_atoms: torch.Tensor | None = None,
+    ) -> None:
         if text_emb.shape[0] != batch_size:
             raise ValueError(f"text_emb batch mismatch: expected {batch_size}, got {text_emb.shape[0]}")
         if gaf is not None and gaf.shape[0] != batch_size:
             raise ValueError(f"gaf batch mismatch: expected {batch_size}, got {gaf.shape[0]}")
+        if semantic_atoms is not None and semantic_atoms.shape[0] != batch_size:
+            raise ValueError(f"semantic_atoms batch mismatch: expected {batch_size}, got {semantic_atoms.shape[0]}")
 
     def q_sample(self, x_start: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
         return extract(self.sqrt_alpha_bars, t, x_start.shape) * x_start + extract(
             self.sqrt_one_minus_alpha_bars, t, x_start.shape
         ) * noise
 
-    def training_loss(self, x_start: torch.Tensor, text_emb: torch.Tensor, gaf: torch.Tensor | None = None) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        self._validate_condition_batch(x_start.shape[0], text_emb, gaf)
+    def training_loss(
+        self,
+        x_start: torch.Tensor,
+        text_emb: torch.Tensor,
+        gaf: torch.Tensor | None = None,
+        semantic_atoms: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        self._validate_condition_batch(x_start.shape[0], text_emb, gaf, semantic_atoms)
         t = torch.randint(0, self.num_steps, (x_start.shape[0],), device=x_start.device)
         noise = torch.randn_like(x_start)
         x_noisy = self.q_sample(x_start, t, noise)
-        pred_noise, aux = self.model(x_noisy, t, text_emb, gaf)
+        pred_noise, aux = self.model(x_noisy, t, text_emb, gaf, semantic_atoms=semantic_atoms)
         loss_diff = F.mse_loss(pred_noise, noise)
         if self.lambda_spectral > 0.0:
             sqrt_ab = extract(self.sqrt_alpha_bars, t, x_start.shape)
@@ -181,12 +194,20 @@ class GaussianDiffusion(nn.Module):
             loss_spectral = loss_diff.new_zeros(())
             spectral_weight = loss_diff.new_zeros(())
         slot_aux_loss = aux.get("slot_aux_loss", loss_diff.new_zeros(()))
-        loss = loss_diff + self.lambda_spectral * loss_spectral + slot_aux_loss
+        grounding_aux_loss = aux.get("grounding_aux_loss", loss_diff.new_zeros(()))
+        loss = loss_diff + self.lambda_spectral * loss_spectral + slot_aux_loss + grounding_aux_loss
         metrics = {
             "loss": loss.detach(),
             "loss_diff": loss_diff.detach(),
             "loss_spectral": loss_spectral.detach(),
             "loss_slot_aux": slot_aux_loss.detach(),
+            "loss_grounding_aux": grounding_aux_loss.detach(),
+            "grounding_loss_ot": aux.get("grounding_loss_ot", loss_diff.new_zeros(())).detach(),
+            "grounding_loss_mask": aux.get("grounding_loss_mask", loss_diff.new_zeros(())).detach(),
+            "grounding_loss_cycle": aux.get("grounding_loss_cycle", loss_diff.new_zeros(())).detach(),
+            "grounding_transport_entropy": aux.get("grounding_transport_entropy", loss_diff.new_zeros(())).detach(),
+            "grounding_transport_row_error": aux.get("grounding_transport_row_error", loss_diff.new_zeros(())).detach(),
+            "grounding_transport_col_error": aux.get("grounding_transport_col_error", loss_diff.new_zeros(())).detach(),
             "slot_diversity_loss": aux.get("slot_diversity_loss", loss_diff.new_zeros(())).detach(),
             "route_entropy_loss": aux.get("route_entropy_loss", loss_diff.new_zeros(())).detach(),
             "text_slot_align_loss": aux.get("text_slot_align_loss", loss_diff.new_zeros(())).detach(),
@@ -199,12 +220,21 @@ class GaussianDiffusion(nn.Module):
             "text_drop_rate": aux.get("text_drop_rate", torch.tensor(0.0, device=x_start.device)).detach(),
             "env_drop_rate": aux.get("env_drop_rate", torch.tensor(0.0, device=x_start.device)).detach(),
             "semantic_drop_rate": aux.get("semantic_drop_rate", torch.tensor(0.0, device=x_start.device)).detach(),
+            "debug_env_slots_shape": str(tuple(aux["env_slots"].shape)),
+            "debug_env_mix_shape": str(tuple(aux["env_mix"].shape)),
         }
         return loss, metrics
 
     @torch.no_grad()
-    def p_sample(self, x: torch.Tensor, t: torch.Tensor, text_emb: torch.Tensor, gaf: torch.Tensor | None = None) -> torch.Tensor:
-        pred_noise, _ = self.model(x, t, text_emb, gaf)
+    def p_sample(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        text_emb: torch.Tensor,
+        gaf: torch.Tensor | None = None,
+        semantic_atoms: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        pred_noise, _ = self.model(x, t, text_emb, gaf, semantic_atoms=semantic_atoms)
         beta_t = extract(self.betas, t, x.shape)
         sqrt_one_minus = extract(self.sqrt_one_minus_alpha_bars, t, x.shape)
         sqrt_recip_alpha = torch.rsqrt(extract(self.alphas, t, x.shape))
@@ -215,8 +245,15 @@ class GaussianDiffusion(nn.Module):
         return mean + nonzero * torch.sqrt(var) * noise
 
     @torch.no_grad()
-    def ddim_sample_step(self, x: torch.Tensor, t: torch.Tensor, text_emb: torch.Tensor, gaf: torch.Tensor | None = None) -> torch.Tensor:
-        pred_noise, _ = self.model(x, t, text_emb, gaf)
+    def ddim_sample_step(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        text_emb: torch.Tensor,
+        gaf: torch.Tensor | None = None,
+        semantic_atoms: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        pred_noise, _ = self.model(x, t, text_emb, gaf, semantic_atoms=semantic_atoms)
         alpha_bar_t = extract(self.alpha_bars, t, x.shape)
         prev_t = (t - 1).clamp_min(0)
         alpha_bar_prev = extract(self.alpha_bars, prev_t, x.shape)
@@ -230,17 +267,24 @@ class GaussianDiffusion(nn.Module):
         return x_prev
 
     @torch.no_grad()
-    def sample(self, shape: tuple[int, int, int], text_emb: torch.Tensor, gaf: torch.Tensor | None = None, sampler: str = "ddpm") -> torch.Tensor:
+    def sample(
+        self,
+        shape: tuple[int, int, int],
+        text_emb: torch.Tensor,
+        gaf: torch.Tensor | None = None,
+        sampler: str = "ddpm",
+        semantic_atoms: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if sampler not in {"ddpm", "ddim"}:
             raise ValueError(f"Unsupported sampler: {sampler}")
-        self._validate_condition_batch(shape[0], text_emb, gaf)
+        self._validate_condition_batch(shape[0], text_emb, gaf, semantic_atoms)
         x = torch.randn(shape, device=text_emb.device)
         for step in reversed(range(self.num_steps)):
             t = torch.full((shape[0],), step, device=text_emb.device, dtype=torch.long)
             if sampler == "ddpm":
-                x = self.p_sample(x, t, text_emb, gaf)
+                x = self.p_sample(x, t, text_emb, gaf, semantic_atoms)
             else:
-                x = self.ddim_sample_step(x, t, text_emb, gaf)
+                x = self.ddim_sample_step(x, t, text_emb, gaf, semantic_atoms)
         return x
 
 
@@ -285,11 +329,18 @@ class RectifiedFlow(nn.Module):
         )
 
     @staticmethod
-    def _validate_condition_batch(batch_size: int, text_emb: torch.Tensor, gaf: torch.Tensor | None = None) -> None:
+    def _validate_condition_batch(
+        batch_size: int,
+        text_emb: torch.Tensor,
+        gaf: torch.Tensor | None = None,
+        semantic_atoms: torch.Tensor | None = None,
+    ) -> None:
         if text_emb.shape[0] != batch_size:
             raise ValueError(f"text_emb batch mismatch: expected {batch_size}, got {text_emb.shape[0]}")
         if gaf is not None and gaf.shape[0] != batch_size:
             raise ValueError(f"gaf batch mismatch: expected {batch_size}, got {gaf.shape[0]}")
+        if semantic_atoms is not None and semantic_atoms.shape[0] != batch_size:
+            raise ValueError(f"semantic_atoms batch mismatch: expected {batch_size}, got {semantic_atoms.shape[0]}")
 
     def _model_time(self, t: torch.Tensor) -> torch.Tensor:
         return t * float(self.num_steps)
@@ -309,8 +360,9 @@ class RectifiedFlow(nn.Module):
         x_start: torch.Tensor,
         text_emb: torch.Tensor,
         gaf: torch.Tensor | None = None,
+        semantic_atoms: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        self._validate_condition_batch(x_start.shape[0], text_emb, gaf)
+        self._validate_condition_batch(x_start.shape[0], text_emb, gaf, semantic_atoms)
         bsz = x_start.shape[0]
         t = torch.rand(bsz, device=x_start.device)
         t = t * (1.0 - 2.0 * self.t_eps) + self.t_eps
@@ -318,7 +370,13 @@ class RectifiedFlow(nn.Module):
         noise = torch.randn_like(x_start)
         x_t = (1.0 - t_view) * x_start + t_view * noise
         target_v = noise - x_start
-        pred_v, aux = self.model(x_t, self._model_time(t), text_emb, gaf)
+        pred_v, aux = self.model(
+            x_t,
+            self._model_time(t),
+            text_emb,
+            gaf,
+            semantic_atoms=semantic_atoms,
+        )
         loss_flow = F.mse_loss(pred_v, target_v)
 
         x0_pred = (x_t - t_view * pred_v).clamp(-5.0, 5.0)
@@ -331,6 +389,7 @@ class RectifiedFlow(nn.Module):
             spectral_weight = loss_flow.new_zeros(())
 
         slot_aux_loss = aux.get("slot_aux_loss", loss_flow.new_zeros(()))
+        grounding_aux_loss = aux.get("grounding_aux_loss", loss_flow.new_zeros(()))
         loss_cycle_relation = self._cycle_relation_loss(x0_pred, x_start, aux.get("env_slots") if gaf is not None else None)
         if {"series_summary", "semantic_summary", "relation_summary"}.issubset(aux):
             loss_triad = triad_contrastive_loss(
@@ -345,6 +404,7 @@ class RectifiedFlow(nn.Module):
             loss_flow
             + self.lambda_spectral * loss_spectral
             + slot_aux_loss
+            + grounding_aux_loss
             + self.lambda_cycle_relation * loss_cycle_relation
             + self.lambda_triad_contrastive * loss_triad
         )
@@ -354,8 +414,15 @@ class RectifiedFlow(nn.Module):
             "loss_diff": loss_flow.detach(),
             "loss_spectral": loss_spectral.detach(),
             "loss_slot_aux": slot_aux_loss.detach(),
+            "loss_grounding_aux": grounding_aux_loss.detach(),
             "loss_cycle_relation": loss_cycle_relation.detach(),
             "loss_triad_contrastive": loss_triad.detach(),
+            "grounding_loss_ot": aux.get("grounding_loss_ot", loss_flow.new_zeros(())).detach(),
+            "grounding_loss_mask": aux.get("grounding_loss_mask", loss_flow.new_zeros(())).detach(),
+            "grounding_loss_cycle": aux.get("grounding_loss_cycle", loss_flow.new_zeros(())).detach(),
+            "grounding_transport_entropy": aux.get("grounding_transport_entropy", loss_flow.new_zeros(())).detach(),
+            "grounding_transport_row_error": aux.get("grounding_transport_row_error", loss_flow.new_zeros(())).detach(),
+            "grounding_transport_col_error": aux.get("grounding_transport_col_error", loss_flow.new_zeros(())).detach(),
             "slot_diversity_loss": aux.get("slot_diversity_loss", loss_flow.new_zeros(())).detach(),
             "route_entropy_loss": aux.get("route_entropy_loss", loss_flow.new_zeros(())).detach(),
             "text_slot_align_loss": aux.get("text_slot_align_loss", loss_flow.new_zeros(())).detach(),
@@ -368,6 +435,8 @@ class RectifiedFlow(nn.Module):
             "text_drop_rate": aux.get("text_drop_rate", torch.tensor(0.0, device=x_start.device)).detach(),
             "env_drop_rate": aux.get("env_drop_rate", torch.tensor(0.0, device=x_start.device)).detach(),
             "semantic_drop_rate": aux.get("semantic_drop_rate", torch.tensor(0.0, device=x_start.device)).detach(),
+            "debug_env_slots_shape": str(tuple(aux["env_slots"].shape)),
+            "debug_env_mix_shape": str(tuple(aux["env_mix"].shape)),
         }
         return loss, metrics
 
@@ -378,6 +447,7 @@ class RectifiedFlow(nn.Module):
         t: torch.Tensor,
         text_emb: torch.Tensor,
         gaf: torch.Tensor | None,
+        semantic_atoms: torch.Tensor | None,
         *,
         force_drop_text: bool,
         force_drop_env: bool,
@@ -388,6 +458,7 @@ class RectifiedFlow(nn.Module):
             self._model_time(t),
             text_emb,
             gaf,
+            semantic_atoms=semantic_atoms,
             force_drop_text=force_drop_text,
             force_drop_env=force_drop_env,
             force_drop_semantic=force_drop_semantic,
@@ -401,6 +472,7 @@ class RectifiedFlow(nn.Module):
         t: torch.Tensor,
         text_emb: torch.Tensor,
         gaf: torch.Tensor | None,
+        semantic_atoms: torch.Tensor | None,
         guidance_text: float,
         guidance_relation: float,
         guidance_joint: float,
@@ -410,6 +482,7 @@ class RectifiedFlow(nn.Module):
             t,
             text_emb,
             gaf,
+            semantic_atoms,
             force_drop_text=True,
             force_drop_env=True,
             force_drop_semantic=True,
@@ -419,6 +492,7 @@ class RectifiedFlow(nn.Module):
             t,
             text_emb,
             gaf,
+            semantic_atoms,
             force_drop_text=False,
             force_drop_env=True,
             force_drop_semantic=False,
@@ -428,6 +502,7 @@ class RectifiedFlow(nn.Module):
             t,
             text_emb,
             gaf,
+            semantic_atoms,
             force_drop_text=True,
             force_drop_env=False,
             force_drop_semantic=True,
@@ -437,6 +512,7 @@ class RectifiedFlow(nn.Module):
             t,
             text_emb,
             gaf,
+            semantic_atoms,
             force_drop_text=False,
             force_drop_env=False,
             force_drop_semantic=False,
@@ -456,6 +532,7 @@ class RectifiedFlow(nn.Module):
         text_emb: torch.Tensor,
         gaf: torch.Tensor | None = None,
         sampler: str | None = None,
+        semantic_atoms: torch.Tensor | None = None,
         guidance_text: float | None = None,
         guidance_relation: float | None = None,
         guidance_joint: float | None = None,
@@ -463,7 +540,7 @@ class RectifiedFlow(nn.Module):
         sampler = sampler or self.solver
         if sampler not in {"euler", "heun"}:
             raise ValueError(f"Unsupported rectified-flow sampler: {sampler}")
-        self._validate_condition_batch(shape[0], text_emb, gaf)
+        self._validate_condition_batch(shape[0], text_emb, gaf, semantic_atoms)
         g_text = self.guidance_text if guidance_text is None else float(guidance_text)
         g_relation = self.guidance_relation if guidance_relation is None else float(guidance_relation)
         g_joint = self.guidance_joint if guidance_joint is None else float(guidance_joint)
@@ -473,11 +550,11 @@ class RectifiedFlow(nn.Module):
             t = schedule[idx].expand(shape[0])
             t_next = schedule[idx + 1].expand(shape[0])
             dt = (t_next - t).reshape(shape[0], *((1,) * (len(shape) - 1)))
-            v = self._guided_velocity(x, t, text_emb, gaf, g_text, g_relation, g_joint)
+            v = self._guided_velocity(x, t, text_emb, gaf, semantic_atoms, g_text, g_relation, g_joint)
             if sampler == "euler":
                 x = x + dt * v
             else:
                 x_euler = x + dt * v
-                v_next = self._guided_velocity(x_euler, t_next, text_emb, gaf, g_text, g_relation, g_joint)
+                v_next = self._guided_velocity(x_euler, t_next, text_emb, gaf, semantic_atoms, g_text, g_relation, g_joint)
                 x = x + 0.5 * dt * (v + v_next)
         return x

@@ -39,6 +39,14 @@ class CMTSGModel(nn.Module):
         mmdit_dim_head: int | None = None,
         qk_rmsnorm: bool = True,
         softclamp: bool = True,
+        use_semantic_grounding: bool = True,
+        grounding_num_heads: int = 4,
+        grounding_sinkhorn_iters: int = 24,
+        grounding_ot_temperature: float = 0.07,
+        grounding_mask_temperature: float = 1.0,
+        grounding_ot_weight: float = 0.01,
+        grounding_mask_weight: float = 0.01,
+        grounding_cycle_weight: float = 0.01,
         slot_diversity_weight: float = 0.01,
         route_entropy_weight: float = 0.001,
         text_slot_align_weight: float = 0.01,
@@ -58,6 +66,9 @@ class CMTSGModel(nn.Module):
         self.route_entropy_weight = float(route_entropy_weight)
         self.text_slot_align_weight = float(text_slot_align_weight)
         self.text_env_slot_weight = float(text_env_slot_weight)
+        self.grounding_ot_weight = float(grounding_ot_weight)
+        self.grounding_mask_weight = float(grounding_mask_weight)
+        self.grounding_cycle_weight = float(grounding_cycle_weight)
         self.route_entropy_scale = 1.0
         self.text_drop_prob = float(text_drop_prob)
         self.env_drop_prob = float(env_drop_prob)
@@ -96,6 +107,11 @@ class CMTSGModel(nn.Module):
                 dim_head=mmdit_dim_head,
                 qk_rmsnorm=qk_rmsnorm,
                 softclamp=softclamp,
+                use_semantic_grounding=use_semantic_grounding,
+                grounding_num_heads=grounding_num_heads,
+                grounding_sinkhorn_iters=grounding_sinkhorn_iters,
+                grounding_ot_temperature=grounding_ot_temperature,
+                grounding_mask_temperature=grounding_mask_temperature,
             )
         elif architecture in {"factorized_dit", "dit"}:
             self.dit = TimeSeriesDiT(
@@ -126,6 +142,7 @@ class CMTSGModel(nn.Module):
         t: torch.Tensor,
         text_emb: torch.Tensor,
         gaf: torch.Tensor | None = None,
+        semantic_atoms: torch.Tensor | None = None,
         *,
         force_drop_text: bool = False,
         force_drop_env: bool = False,
@@ -145,13 +162,21 @@ class CMTSGModel(nn.Module):
             text_for_dit = torch.where(drop_text[:, None], null_text, text_for_dit)
         else:
             drop_text = torch.zeros(batch_size, device=device, dtype=torch.bool)
-        semantic_text = text_for_dit
+        semantic_text = semantic_atoms if semantic_atoms is not None else text_for_dit
+        null_semantic = (
+            null_text[:, None, :].expand(-1, semantic_text.shape[1], -1)
+            if semantic_text.ndim == 3
+            else null_text
+        )
         if force_drop_semantic:
-            semantic_text = null_text
+            semantic_text = null_semantic
             drop_semantic = torch.ones(batch_size, device=device, dtype=torch.bool)
         elif self.training and self.semantic_drop_prob > 0:
             drop_semantic = torch.rand(batch_size, device=device) < self.semantic_drop_prob
-            semantic_text = torch.where(drop_semantic[:, None], null_text, semantic_text)
+            if semantic_text.ndim == 3:
+                semantic_text = torch.where(drop_semantic[:, None, None], null_semantic, semantic_text)
+            else:
+                semantic_text = torch.where(drop_semantic[:, None], null_semantic, semantic_text)
         else:
             drop_semantic = torch.zeros(batch_size, device=device, dtype=torch.bool)
         router_text = text_for_dit
@@ -214,10 +239,19 @@ class CMTSGModel(nn.Module):
             )
         else:
             pred = self.dit(x, t, text_for_dit, env_mix, env_slots)
+        grounding_loss_ot = denoiser_aux.get("grounding_loss_ot", env_mix.new_zeros(()))
+        grounding_loss_mask = denoiser_aux.get("grounding_loss_mask", env_mix.new_zeros(()))
+        grounding_loss_cycle = denoiser_aux.get("grounding_loss_cycle", env_mix.new_zeros(()))
+        grounding_aux_loss = (
+            self.grounding_ot_weight * grounding_loss_ot
+            + self.grounding_mask_weight * grounding_loss_mask
+            + self.grounding_cycle_weight * grounding_loss_cycle
+        )
         entropy = -(alpha * alpha.clamp_min(1e-8).log()).sum(dim=-1).mean()
         aux = {
             "alpha": alpha,
             "env_raw": env_raw,
+            "env_mix": env_mix,
             "env_slots": env_slots,
             "slot_aux_loss": slot_aux_loss,
             "slot_diversity_loss": router_aux["slot_diversity_loss"],
@@ -231,6 +265,13 @@ class CMTSGModel(nn.Module):
             "text_drop_rate": drop_text.float().mean(),
             "env_drop_rate": drop_env.float().mean(),
             "semantic_drop_rate": drop_semantic.float().mean(),
+            "grounding_aux_loss": grounding_aux_loss,
+            "grounding_loss_ot": grounding_loss_ot,
+            "grounding_loss_mask": grounding_loss_mask,
+            "grounding_loss_cycle": grounding_loss_cycle,
+            "grounding_transport_entropy": denoiser_aux.get("grounding_transport_entropy", env_mix.new_zeros(())),
+            "grounding_transport_row_error": denoiser_aux.get("grounding_transport_row_error", env_mix.new_zeros(())),
+            "grounding_transport_col_error": denoiser_aux.get("grounding_transport_col_error", env_mix.new_zeros(())),
         }
         aux.update(denoiser_aux)
         return pred, aux

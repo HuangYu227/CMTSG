@@ -32,7 +32,7 @@ def copy_dataset(source: Path, target: Path, overwrite: bool = False) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Copy VerbalTS-style npy dataset into CMTSG datasets/.")
-    parser.add_argument("--dataset", required=True, choices=["weather", "synth-m"])
+    parser.add_argument("--dataset", required=True)
     parser.add_argument("--source", required=True)
     parser.add_argument("--target", default=None)
     parser.add_argument("--overwrite", action="store_true")
