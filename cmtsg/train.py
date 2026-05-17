@@ -202,6 +202,14 @@ def _loader_kwargs(num_workers: int, device: torch.device) -> dict:
     return kwargs
 
 
+def _cuda_memory_gb(device: torch.device) -> str:
+    if device.type != "cuda":
+        return "cpu"
+    allocated = torch.cuda.memory_allocated(device) / (1024**3)
+    reserved = torch.cuda.memory_reserved(device) / (1024**3)
+    return f"alloc={allocated:.2f}GB reserved={reserved:.2f}GB"
+
+
 def train(args: argparse.Namespace) -> None:
     cfg = load_config(args.config)
     set_seed(int(cfg.get("seed", 42)))
@@ -244,6 +252,7 @@ def train(args: argparse.Namespace) -> None:
     )
     grad_clip = float(get_nested(cfg, "training.grad_clip", 1.0))
     grad_norm_every = int(get_nested(cfg, "training.grad_norm_every", 50))
+    log_every = int(args.log_every if args.log_every is not None else get_nested(cfg, "training.log_every", 50))
     epochs = int(args.epochs or get_nested(cfg, "training.epochs", 50))
     best_val = float("inf")
     stats = {
@@ -252,8 +261,12 @@ def train(args: argparse.Namespace) -> None:
         "seq_len": seq_len,
         "n_vars": n_vars,
         "gaf_size": gaf_size,
-        "gaf_max_size": gaf_max_size,
-        "model_ablation": {
+            "gaf_max_size": gaf_max_size,
+            "batch_size": batch_size,
+            "num_workers": num_workers,
+            "train_batches_per_epoch": len(train_loader),
+            "valid_batches_per_epoch": len(valid_loader),
+            "model_ablation": {
             "architecture": str(cfg.get("model", {}).get("architecture", "causal_relation_mmdit")),
             "objective": str(cfg.get("diffusion", {}).get("objective", "rectified_flow")),
             "use_text_condition": bool(cfg.get("model", {}).get("use_text_condition", True)),
@@ -277,6 +290,19 @@ def train(args: argparse.Namespace) -> None:
     best_metric_specs = eval_cfg.get("best_metrics") or _default_best_metric_specs()
     best_sample_metrics: dict[str, float] = {}
     route_entropy_warmup_epochs = float(cfg.get("model", {}).get("route_entropy_warmup_epochs", 10.0))
+    print(
+        "train_setup "
+        f"device={device} "
+        f"cuda={torch.cuda.is_available()} "
+        f"dataset={cfg.get('dataset', data_root.name)} "
+        f"seq_len={seq_len} n_vars={n_vars} gaf_size={gaf_size} "
+        f"train_samples={len(train_ds)} valid_samples={len(valid_ds)} "
+        f"batch_size={batch_size} train_batches={len(train_loader)} "
+        f"num_workers={num_workers} "
+        f"train_gaf_cache={train_ds.gaf_cache is not None} "
+        f"valid_gaf_cache={valid_ds.gaf_cache is not None}",
+        flush=True,
+    )
 
     for epoch in range(1, epochs + 1):
         if route_entropy_warmup_epochs > 0:
@@ -312,11 +338,21 @@ def train(args: argparse.Namespace) -> None:
         train_grounding_grad = []
         train_mmdit_grad = []
         debug_shapes: dict[str, str] = {}
+        print(
+            f"epoch={epoch:04d} begin route_entropy_scale={route_entropy_scale:.4f} "
+            f"waiting_for_first_batch=1",
+            flush=True,
+        )
+        data_wait_start = time.perf_counter()
         for step_idx, batch in enumerate(train_loader):
+            data_wait_seconds = time.perf_counter() - data_wait_start
+            step_start = time.perf_counter()
             x = batch["x"].to(device, non_blocking=True)
             text_emb = batch["text_emb"].to(device, non_blocking=True)
             gaf = batch["gaf"].to(device, non_blocking=True)
             semantic_atoms = _optional_to_device(batch, "semantic_atoms", device)
+            h2d_seconds = time.perf_counter() - step_start
+            compute_start = time.perf_counter()
             loss, metrics = diffusion.training_loss(x, text_emb, gaf, semantic_atoms=semantic_atoms)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -328,6 +364,9 @@ def train(args: argparse.Namespace) -> None:
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(diffusion.parameters(), grad_clip)
             optimizer.step()
+            if device.type == "cuda" and log_every > 0 and (step_idx == 0 or (step_idx + 1) % log_every == 0):
+                torch.cuda.synchronize(device)
+            compute_seconds = time.perf_counter() - compute_start
             if not debug_shapes:
                 debug_shapes = {
                     "debug_x_shape": _shape_str(x),
@@ -359,6 +398,15 @@ def train(args: argparse.Namespace) -> None:
             _record(train_text_drop, metrics["text_drop_rate"])
             _record(train_env_drop, metrics["env_drop_rate"])
             _record(train_semantic_drop, metrics.get("semantic_drop_rate", torch.tensor(0.0, device=device)))
+            if log_every > 0 and (step_idx == 0 or (step_idx + 1) % log_every == 0):
+                print(
+                    f"epoch={epoch:04d} step={step_idx + 1:05d}/{len(train_loader):05d} "
+                    f"loss={float(loss.detach().item()):.6f} "
+                    f"data_wait={data_wait_seconds:.3f}s h2d={h2d_seconds:.3f}s "
+                    f"compute={compute_seconds:.3f}s {_cuda_memory_gb(device)}",
+                    flush=True,
+                )
+            data_wait_start = time.perf_counter()
 
         diffusion.eval()
         val_losses = []
@@ -474,7 +522,8 @@ def train(args: argparse.Namespace) -> None:
             f"route_max={row['val_route_max']:.4f} "
             f"grad_gaf={row['train_gaf_encoder_grad_norm']:.3e} "
             f"grad_ground={row['train_grounding_grad_norm']:.3e} "
-            f"grad_mmdit={row['train_mmdit_grad_norm']:.3e}"
+            f"grad_mmdit={row['train_mmdit_grad_norm']:.3e}",
+            flush=True,
         )
 
         _save_checkpoint(output_root / "checkpoints" / "last.pt", diffusion, optimizer, epoch, cfg, stats)
@@ -627,6 +676,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sample-after-train", action="store_true")
     parser.add_argument("--sample-count", type=int, default=16)
     parser.add_argument("--sample-every", type=int, default=None)
+    parser.add_argument("--log-every", type=int, default=None)
     return parser
 
 

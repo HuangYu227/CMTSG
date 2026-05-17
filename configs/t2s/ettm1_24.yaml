@@ -79,6 +79,7 @@ training:
   grad_clip: 1.0
   num_workers: 4
   grad_norm_every: 100
+  log_every: 20
   save_every: 10
 
 evaluation:
