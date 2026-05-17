@@ -202,7 +202,6 @@ def _loader_kwargs(num_workers: int, device: torch.device) -> dict:
         "pin_memory": device.type == "cuda",
     }
     if num_workers > 0:
-        kwargs["persistent_workers"] = True
         kwargs["prefetch_factor"] = 4
     return kwargs
 
