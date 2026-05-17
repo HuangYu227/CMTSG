@@ -116,18 +116,30 @@ def _make_model(cfg: dict, seq_len: int, n_vars: int, gaf_size: int) -> Gaussian
     raise ValueError(f"Unsupported diffusion objective: {objective}")
 
 
-def _save_checkpoint(path: Path, diffusion: GaussianDiffusion, optimizer: torch.optim.Optimizer, epoch: int, cfg: dict, stats: dict) -> None:
+def _save_checkpoint(
+    path: Path,
+    diffusion: GaussianDiffusion,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    cfg: dict,
+    stats: dict,
+    *,
+    include_optimizer: bool = False,
+) -> float:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "epoch": epoch,
-            "model": diffusion.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "config": cfg,
-            "stats": stats,
-        },
-        path,
-    )
+    payload = {
+        "epoch": epoch,
+        "model": diffusion.state_dict(),
+        "config": cfg,
+        "stats": stats,
+    }
+    if include_optimizer:
+        payload["optimizer"] = optimizer.state_dict()
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    start = time.perf_counter()
+    torch.save(payload, tmp_path)
+    tmp_path.replace(path)
+    return time.perf_counter() - start
 
 
 def _default_best_metric_specs() -> list[dict[str, str]]:
@@ -196,13 +208,33 @@ def _mean_scalar(values: list[torch.Tensor] | list[float]) -> float:
     return float(np.mean(values))
 
 
-def _loader_kwargs(num_workers: int, device: torch.device) -> dict:
+def _as_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    return bool(value)
+
+
+def _loader_kwargs(
+    num_workers: int,
+    device: torch.device,
+    *,
+    pin_memory: bool = False,
+    persistent_workers: bool = False,
+    prefetch_factor: int = 2,
+) -> dict:
     kwargs = {
         "num_workers": int(num_workers),
-        "pin_memory": device.type == "cuda",
+        "pin_memory": bool(pin_memory) and device.type == "cuda",
     }
     if num_workers > 0:
-        kwargs["prefetch_factor"] = 4
+        kwargs["prefetch_factor"] = int(prefetch_factor)
+        kwargs["persistent_workers"] = bool(persistent_workers)
     return kwargs
 
 
@@ -234,18 +266,45 @@ def train(args: argparse.Namespace) -> None:
     valid_ds = CMTSGDataset(data_root, processed_root, "valid", mean=mean, std=std, train=False, gaf_max_size=gaf_max_size)
     batch_size = int(args.batch_size or get_nested(cfg, "training.batch_size", 128))
     num_workers = int(get_nested(cfg, "training.num_workers", 0))
+    log_every = int(args.log_every if args.log_every is not None else get_nested(cfg, "training.log_every", 50))
+    val_log_every = int(args.val_log_every if args.val_log_every is not None else get_nested(cfg, "training.val_log_every", max(1, log_every)))
+    pin_memory = _as_bool(args.pin_memory if args.pin_memory is not None else get_nested(cfg, "training.pin_memory", False))
+    persistent_workers = _as_bool(
+        args.persistent_workers
+        if args.persistent_workers is not None
+        else get_nested(cfg, "training.persistent_workers", False)
+    )
+    prefetch_factor = int(get_nested(cfg, "training.prefetch_factor", 2))
+    valid_num_workers = int(args.valid_num_workers if args.valid_num_workers is not None else get_nested(cfg, "training.valid_num_workers", 0))
+    save_every = int(get_nested(cfg, "training.save_every", 10))
+    save_last_every = int(args.save_last_every if args.save_last_every is not None else get_nested(cfg, "training.save_last_every", save_every))
+    save_optimizer_every = int(args.save_optimizer_every if args.save_optimizer_every is not None else get_nested(cfg, "training.save_optimizer_every", save_every))
+    save_optimizer_best = _as_bool(get_nested(cfg, "training.save_optimizer_best", False))
+    save_optimizer_last = _as_bool(get_nested(cfg, "training.save_optimizer_last", False))
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
         shuffle=True,
         drop_last=True,
-        **_loader_kwargs(num_workers, device),
+        **_loader_kwargs(
+            num_workers,
+            device,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
+        ),
     )
     valid_loader = DataLoader(
         valid_ds,
         batch_size=batch_size,
         shuffle=False,
-        **_loader_kwargs(max(1, min(num_workers, 2)), device),
+        **_loader_kwargs(
+            valid_num_workers,
+            device,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
+        ),
     )
 
     diffusion = _make_model(cfg, seq_len, n_vars, gaf_size).to(device)
@@ -256,7 +315,6 @@ def train(args: argparse.Namespace) -> None:
     )
     grad_clip = float(get_nested(cfg, "training.grad_clip", 1.0))
     grad_norm_every = int(get_nested(cfg, "training.grad_norm_every", 50))
-    log_every = int(args.log_every if args.log_every is not None else get_nested(cfg, "training.log_every", 50))
     epochs = int(args.epochs or get_nested(cfg, "training.epochs", 50))
     best_val = float("inf")
     stats = {
@@ -268,6 +326,13 @@ def train(args: argparse.Namespace) -> None:
             "gaf_max_size": gaf_max_size,
             "batch_size": batch_size,
             "num_workers": num_workers,
+            "valid_num_workers": valid_num_workers,
+            "pin_memory": pin_memory,
+            "persistent_workers": persistent_workers,
+            "prefetch_factor": prefetch_factor,
+            "save_every": save_every,
+            "save_last_every": save_last_every,
+            "save_optimizer_every": save_optimizer_every,
             "train_batches_per_epoch": len(train_loader),
             "valid_batches_per_epoch": len(valid_loader),
             "model_ablation": {
@@ -302,7 +367,11 @@ def train(args: argparse.Namespace) -> None:
         f"seq_len={seq_len} n_vars={n_vars} gaf_size={gaf_size} "
         f"train_samples={len(train_ds)} valid_samples={len(valid_ds)} "
         f"batch_size={batch_size} train_batches={len(train_loader)} "
-        f"num_workers={num_workers} "
+        f"valid_batches={len(valid_loader)} num_workers={num_workers} "
+        f"valid_num_workers={valid_num_workers} "
+        f"pin_memory={pin_memory} persistent_workers={persistent_workers} "
+        f"prefetch_factor={prefetch_factor} "
+        f"save_last_every={save_last_every} save_optimizer_every={save_optimizer_every} "
         f"train_gaf_cache={train_ds.gaf_cache is not None} "
         f"valid_gaf_cache={valid_ds.gaf_cache is not None}",
         flush=True,
@@ -327,6 +396,9 @@ def train(args: argparse.Namespace) -> None:
         train_consistency_triad = []
         train_consistency_cycle_rel = []
         train_consistency_slot_div = []
+        train_slot_aux = []
+        train_ground_weighted = []
+        train_consistency_weighted = []
         train_spectral_weight = []
         train_route_entropy = []
         train_route_max = []
@@ -388,6 +460,9 @@ def train(args: argparse.Namespace) -> None:
             _record(train_consistency_triad, metrics.get("consistency_triad", torch.tensor(0.0, device=device)))
             _record(train_consistency_cycle_rel, metrics.get("consistency_cycle_rel", torch.tensor(0.0, device=device)))
             _record(train_consistency_slot_div, metrics.get("consistency_slot_diversity", torch.tensor(0.0, device=device)))
+            _record(train_slot_aux, metrics.get("slot_aux_loss", torch.tensor(0.0, device=device)))
+            _record(train_ground_weighted, metrics.get("loss_l2_ground_weighted", torch.tensor(0.0, device=device)))
+            _record(train_consistency_weighted, metrics.get("loss_l4_consistency_weighted", torch.tensor(0.0, device=device)))
             _record(train_spectral_weight, metrics["spectral_weight"])
             _record(train_route_entropy, metrics["route_entropy"])
             _record(train_route_max, metrics["route_max"])
@@ -404,6 +479,7 @@ def train(args: argparse.Namespace) -> None:
                 )
             data_wait_start = time.perf_counter()
 
+        print(f"epoch={epoch:04d} [DIAG] starting validation", flush=True)
         diffusion.eval()
         val_losses = []
         val_loss_l1 = []
@@ -416,6 +492,9 @@ def train(args: argparse.Namespace) -> None:
         val_consistency_triad = []
         val_consistency_cycle_rel = []
         val_consistency_slot_div = []
+        val_slot_aux = []
+        val_ground_weighted = []
+        val_consistency_weighted = []
         val_spectral_weight = []
         val_route_entropy = []
         val_route_max = []
@@ -423,7 +502,11 @@ def train(args: argparse.Namespace) -> None:
         val_env_drop = []
         val_semantic_drop = []
         with torch.no_grad():
-            for batch in valid_loader:
+            print(f"epoch={epoch:04d} [DIAG] entering val_loader loop", flush=True)
+            val_wait_start = time.perf_counter()
+            for val_step_idx, batch in enumerate(valid_loader):
+                val_wait_seconds = time.perf_counter() - val_wait_start
+                val_compute_start = time.perf_counter()
                 x = batch["x"].to(device, non_blocking=True)
                 text_emb = batch["text_emb"].to(device, non_blocking=True)
                 gaf = batch["gaf"].to(device, non_blocking=True)
@@ -440,12 +523,28 @@ def train(args: argparse.Namespace) -> None:
                 _record(val_consistency_triad, metrics.get("consistency_triad", torch.tensor(0.0, device=device)))
                 _record(val_consistency_cycle_rel, metrics.get("consistency_cycle_rel", torch.tensor(0.0, device=device)))
                 _record(val_consistency_slot_div, metrics.get("consistency_slot_diversity", torch.tensor(0.0, device=device)))
+                _record(val_slot_aux, metrics.get("slot_aux_loss", torch.tensor(0.0, device=device)))
+                _record(val_ground_weighted, metrics.get("loss_l2_ground_weighted", torch.tensor(0.0, device=device)))
+                _record(val_consistency_weighted, metrics.get("loss_l4_consistency_weighted", torch.tensor(0.0, device=device)))
                 _record(val_spectral_weight, metrics["spectral_weight"])
                 _record(val_route_entropy, metrics["route_entropy"])
                 _record(val_route_max, metrics["route_max"])
                 _record(val_text_drop, metrics["text_drop_rate"])
                 _record(val_env_drop, metrics["env_drop_rate"])
                 _record(val_semantic_drop, metrics.get("semantic_drop_rate", torch.tensor(0.0, device=device)))
+                if val_log_every > 0 and (val_step_idx == 0 or (val_step_idx + 1) % val_log_every == 0):
+                    if device.type == "cuda":
+                        torch.cuda.synchronize(device)
+                    val_compute_seconds = time.perf_counter() - val_compute_start
+                    print(
+                        f"epoch={epoch:04d} val_step={val_step_idx + 1:05d}/{len(valid_loader):05d} "
+                        f"loss={float(loss.detach().item()):.6f} "
+                        f"data_wait={val_wait_seconds:.3f}s compute={val_compute_seconds:.3f}s "
+                        f"{_cuda_memory_gb(device)}",
+                        flush=True,
+                    )
+                val_wait_start = time.perf_counter()
+            print(f"epoch={epoch:04d} [DIAG] val loop done, {len(val_losses)} batches", flush=True)
         train_loss = _mean_scalar(train_losses)
         val_loss = _mean_scalar(val_losses)
         row = {
@@ -462,6 +561,9 @@ def train(args: argparse.Namespace) -> None:
             "train_consistency_triad": _mean_scalar(train_consistency_triad),
             "train_consistency_cycle_rel": _mean_scalar(train_consistency_cycle_rel),
             "train_consistency_slot_div": _mean_scalar(train_consistency_slot_div),
+            "train_slot_aux": _mean_scalar(train_slot_aux),
+            "train_l2_ground_weighted": _mean_scalar(train_ground_weighted),
+            "train_l4_consistency_weighted": _mean_scalar(train_consistency_weighted),
             "train_spectral_weight": _mean_scalar(train_spectral_weight),
             "val_l1_flow": _mean_scalar(val_loss_l1),
             "val_l2_ground": _mean_scalar(val_loss_l2),
@@ -473,6 +575,9 @@ def train(args: argparse.Namespace) -> None:
             "val_consistency_triad": _mean_scalar(val_consistency_triad),
             "val_consistency_cycle_rel": _mean_scalar(val_consistency_cycle_rel),
             "val_consistency_slot_div": _mean_scalar(val_consistency_slot_div),
+            "val_slot_aux": _mean_scalar(val_slot_aux),
+            "val_l2_ground_weighted": _mean_scalar(val_ground_weighted),
+            "val_l4_consistency_weighted": _mean_scalar(val_consistency_weighted),
             "val_spectral_weight": _mean_scalar(val_spectral_weight),
             "train_route_entropy": _mean_scalar(train_route_entropy),
             "train_route_max": _mean_scalar(train_route_max),
@@ -502,12 +607,64 @@ def train(args: argparse.Namespace) -> None:
             flush=True,
         )
 
-        _save_checkpoint(output_root / "checkpoints" / "last.pt", diffusion, optimizer, epoch, cfg, stats)
+        print(f"epoch={epoch:04d} [DIAG] checkpoint stage begin", flush=True)
+        checkpoint_dir = output_root / "checkpoints"
+        saved_checkpoint = False
+        if save_last_every > 0 and epoch % save_last_every == 0:
+            include_optimizer = save_optimizer_last and (
+                save_optimizer_every > 0 and epoch % save_optimizer_every == 0
+            )
+            seconds = _save_checkpoint(
+                checkpoint_dir / "last.pt",
+                diffusion,
+                optimizer,
+                epoch,
+                cfg,
+                stats,
+                include_optimizer=include_optimizer,
+            )
+            saved_checkpoint = True
+            print(
+                f"epoch={epoch:04d} [DIAG] saved last.pt seconds={seconds:.2f} "
+                f"include_optimizer={include_optimizer}",
+                flush=True,
+            )
         if val_loss < best_val:
             best_val = val_loss
-            _save_checkpoint(output_root / "checkpoints" / "best.pt", diffusion, optimizer, epoch, cfg, stats)
-        if epoch % int(get_nested(cfg, "training.save_every", 10)) == 0:
-            _save_checkpoint(output_root / "checkpoints" / f"epoch_{epoch:04d}.pt", diffusion, optimizer, epoch, cfg, stats)
+            seconds = _save_checkpoint(
+                checkpoint_dir / "best.pt",
+                diffusion,
+                optimizer,
+                epoch,
+                cfg,
+                stats,
+                include_optimizer=save_optimizer_best,
+            )
+            saved_checkpoint = True
+            print(
+                f"epoch={epoch:04d} [DIAG] saved best.pt seconds={seconds:.2f} "
+                f"include_optimizer={save_optimizer_best}",
+                flush=True,
+            )
+        if save_every > 0 and epoch % save_every == 0:
+            include_optimizer = save_optimizer_every > 0 and epoch % save_optimizer_every == 0
+            seconds = _save_checkpoint(
+                checkpoint_dir / f"epoch_{epoch:04d}.pt",
+                diffusion,
+                optimizer,
+                epoch,
+                cfg,
+                stats,
+                include_optimizer=include_optimizer,
+            )
+            saved_checkpoint = True
+            print(
+                f"epoch={epoch:04d} [DIAG] saved epoch checkpoint seconds={seconds:.2f} "
+                f"include_optimizer={include_optimizer}",
+                flush=True,
+            )
+        if not saved_checkpoint:
+            print(f"epoch={epoch:04d} [DIAG] checkpoint stage skipped", flush=True)
         if sample_every > 0 and epoch % sample_every == 0:
             sample_metrics = sample_and_score(
                 diffusion,
@@ -547,8 +704,10 @@ def train(args: argparse.Namespace) -> None:
                     )
                     save_json(best_sample_metrics, output_root / "checkpoints" / "best_sample_metrics.json")
 
+        print(f"epoch={epoch:04d} [DIAG] writing logs", flush=True)
         append_csv(log_dir / "epoch_metrics.csv", row)
         append_jsonl(log_dir / "epoch_metrics.jsonl", row)
+        print(f"epoch={epoch:04d} [DIAG] epoch complete", flush=True)
 
     if args.sample_after_train:
         sample_and_score(
@@ -653,6 +812,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sample-count", type=int, default=16)
     parser.add_argument("--sample-every", type=int, default=None)
     parser.add_argument("--log-every", type=int, default=None)
+    parser.add_argument("--val-log-every", type=int, default=None)
+    parser.add_argument("--valid-num-workers", type=int, default=None)
+    parser.add_argument("--pin-memory", dest="pin_memory", action="store_true", default=None)
+    parser.add_argument("--no-pin-memory", dest="pin_memory", action="store_false")
+    parser.add_argument("--persistent-workers", dest="persistent_workers", action="store_true", default=None)
+    parser.add_argument("--no-persistent-workers", dest="persistent_workers", action="store_false")
+    parser.add_argument("--save-last-every", type=int, default=None)
+    parser.add_argument("--save-optimizer-every", type=int, default=None)
     return parser
 
 

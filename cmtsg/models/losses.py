@@ -138,13 +138,16 @@ def compute_all_losses(
     # L1: Flow Matching
     loss_l1 = aux["loss_flow"]
 
-    # L2: Causal Grounding
+    # L2: Causal Grounding. Keep raw components for logging, but use the
+    # model-side weighted auxiliary loss when available so per-component
+    # grounding weights in the config actually affect optimization.
     grounding_raw = {
         "loss_ot": aux.get("grounding_loss_ot", torch.zeros((), device=device)),
         "loss_ground": aux.get("grounding_loss_mask", torch.zeros((), device=device)),
         "loss_cycle": aux.get("grounding_loss_cycle", torch.zeros((), device=device)),
     }
     loss_l2, ground_metrics = causal_grounding_loss(grounding_raw, device)
+    loss_l2_weighted = aux.get("grounding_aux_loss", loss_l2)
 
     # L3: Spectral Structure
     loss_l3, spectral_weight = spectral_structure_loss(
@@ -157,9 +160,15 @@ def compute_all_losses(
     loss_l4, consistency_metrics = causal_consistency_loss(
         aux, env_slots, pred_relation_slots, contrastive_temperature, device,
     )
+    slot_aux_loss = aux.get("slot_aux_loss", torch.zeros((), device=device))
+    loss_l4_weighted = (
+        lambda_triad * consistency_metrics["consistency_triad"]
+        + lambda_cycle_relation * consistency_metrics["consistency_cycle_rel"]
+        + slot_aux_loss
+    )
 
     # Total
-    total = loss_l1 + lambda_ground * loss_l2 + lambda_spectral * loss_l3 + loss_l4
+    total = loss_l1 + lambda_ground * loss_l2_weighted + lambda_spectral * loss_l3 + loss_l4_weighted
 
     metrics = {
         "loss": total.detach(),
@@ -167,6 +176,9 @@ def compute_all_losses(
         "loss_l2_ground": loss_l2.detach(),
         "loss_l3_spectral": loss_l3.detach(),
         "loss_l4_consistency": loss_l4.detach(),
+        "loss_l2_ground_weighted": loss_l2_weighted.detach(),
+        "loss_l4_consistency_weighted": loss_l4_weighted.detach(),
+        "slot_aux_loss": slot_aux_loss.detach(),
         "spectral_weight": spectral_weight.detach(),
         **{k: v.detach() for k, v in ground_metrics.items()},
         **{k: v.detach() for k, v in consistency_metrics.items()},
