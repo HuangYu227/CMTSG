@@ -21,6 +21,54 @@ def extract(values: torch.Tensor, t: torch.Tensor, shape: torch.Size) -> torch.T
     return out.reshape(t.shape[0], *((1,) * (len(shape) - 1)))
 
 
+def _randn_like(x: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
+    if generator is None:
+        return torch.randn_like(x)
+    try:
+        return torch.randn(x.shape, device=x.device, dtype=x.dtype, generator=generator)
+    except (TypeError, RuntimeError):
+        return torch.randn_like(x)
+
+
+def _light_validation_metrics(aux: dict[str, torch.Tensor], loss_flow: torch.Tensor) -> dict[str, torch.Tensor]:
+    device = loss_flow.device
+    zero = torch.zeros((), device=device, dtype=loss_flow.dtype)
+    ground_ot = aux.get("grounding_loss_ot", zero)
+    ground_mask = aux.get("grounding_loss_mask", zero)
+    ground_cycle = aux.get("grounding_loss_cycle", zero)
+    ground_total = ground_ot + ground_mask + ground_cycle
+    slot_aux = aux.get("slot_aux_loss", zero)
+    env_slots = aux.get("env_slots")
+    env_mix = aux.get("env_mix")
+    return {
+        "loss": loss_flow.detach(),
+        "loss_l1_flow": loss_flow.detach(),
+        "loss_l2_ground": ground_total.detach(),
+        "loss_l3_spectral": zero.detach(),
+        "loss_l4_consistency": slot_aux.detach(),
+        "loss_l2_ground_weighted": aux.get("grounding_aux_loss", ground_total).detach(),
+        "loss_l4_consistency_weighted": slot_aux.detach(),
+        "slot_aux_loss": slot_aux.detach(),
+        "ground_ot": ground_ot.detach(),
+        "ground_mask": ground_mask.detach(),
+        "ground_cycle": ground_cycle.detach(),
+        "consistency_triad": zero.detach(),
+        "consistency_cycle_rel": zero.detach(),
+        "consistency_slot_diversity": aux.get("slot_diversity_loss", zero).detach(),
+        "spectral_weight": zero.detach(),
+        "route_entropy": aux.get("route_entropy", zero).detach(),
+        "route_max": aux.get("route_max", zero).detach(),
+        "text_drop_rate": aux.get("text_drop_rate", zero).detach(),
+        "env_drop_rate": aux.get("env_drop_rate", zero).detach(),
+        "semantic_drop_rate": aux.get("semantic_drop_rate", zero).detach(),
+        "debug_env_slots_shape": str(tuple(env_slots.shape)) if env_slots is not None else "None",
+        "debug_env_mix_shape": str(tuple(env_mix.shape)) if env_mix is not None else "None",
+        "grounding_transport_entropy": aux.get("grounding_transport_entropy", zero).detach(),
+        "grounding_transport_row_error": aux.get("grounding_transport_row_error", zero).detach(),
+        "grounding_transport_col_error": aux.get("grounding_transport_col_error", zero).detach(),
+    }
+
+
 class GADFRelationalSpectralLoss(nn.Module):
     def __init__(
         self,
@@ -206,6 +254,30 @@ class GaussianDiffusion(nn.Module):
         return loss, metrics
 
     @torch.no_grad()
+    def validation_loss(
+        self,
+        x_start: torch.Tensor,
+        text_emb: torch.Tensor,
+        gaf: torch.Tensor | None = None,
+        semantic_atoms: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        self._validate_condition_batch(x_start.shape[0], text_emb, gaf, semantic_atoms)
+        bsz = x_start.shape[0]
+        if bsz == 1:
+            t = torch.full((1,), self.num_steps // 2, device=x_start.device, dtype=torch.long)
+        else:
+            t = torch.linspace(0, self.num_steps - 1, bsz, device=x_start.device).round().long()
+        noise = _randn_like(x_start, generator=generator)
+        x_noisy = self.q_sample(x_start, t, noise)
+        pred_noise, aux = self.model(x_noisy, t, text_emb, gaf, semantic_atoms=semantic_atoms)
+        loss_flow = F.mse_loss(pred_noise, noise)
+        aux["loss_flow"] = loss_flow
+        metrics = _light_validation_metrics(aux, loss_flow)
+        metrics["loss_diff"] = metrics["loss_l1_flow"]
+        return loss_flow, metrics
+
+    @torch.no_grad()
     def p_sample(
         self,
         x: torch.Tensor,
@@ -383,6 +455,35 @@ class RectifiedFlow(nn.Module):
         # loss_diff alias for backward compatibility with logging
         metrics["loss_diff"] = metrics["loss_l1_flow"]
         return loss, metrics
+
+    @torch.no_grad()
+    def validation_loss(
+        self,
+        x_start: torch.Tensor,
+        text_emb: torch.Tensor,
+        gaf: torch.Tensor | None = None,
+        semantic_atoms: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        self._validate_condition_batch(x_start.shape[0], text_emb, gaf, semantic_atoms)
+        bsz = x_start.shape[0]
+        t = torch.linspace(self.t_eps, 1.0 - self.t_eps, bsz, device=x_start.device, dtype=x_start.dtype)
+        t_view = t.reshape(bsz, *((1,) * (x_start.ndim - 1)))
+        noise = _randn_like(x_start, generator=generator)
+        x_t = (1.0 - t_view) * x_start + t_view * noise
+        target_v = noise - x_start
+        pred_v, aux = self.model(
+            x_t,
+            self._model_time(t),
+            text_emb,
+            gaf,
+            semantic_atoms=semantic_atoms,
+        )
+        loss_flow = F.mse_loss(pred_v, target_v)
+        aux["loss_flow"] = loss_flow
+        metrics = _light_validation_metrics(aux, loss_flow)
+        metrics["loss_diff"] = metrics["loss_l1_flow"]
+        return loss_flow, metrics
 
     @torch.no_grad()
     def _predict_velocity(

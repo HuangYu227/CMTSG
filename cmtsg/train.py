@@ -195,11 +195,46 @@ def _debug_modules(diffusion: GaussianDiffusion | RectifiedFlow) -> tuple[torch.
     return gaf_encoder, grounding, dit
 
 
-def _record(values: list[torch.Tensor], value: torch.Tensor) -> None:
-    values.append(value.detach())
+class ScalarMeter:
+    def __init__(self) -> None:
+        self.total: torch.Tensor | None = None
+        self.total_float = 0.0
+        self.count = 0
+
+    def update(self, value: torch.Tensor | float | int) -> None:
+        if torch.is_tensor(value):
+            with torch.no_grad():
+                scalar = value.detach().float()
+                if scalar.ndim > 0:
+                    scalar = scalar.mean()
+                if self.total is None:
+                    self.total = scalar.clone()
+                else:
+                    self.total.add_(scalar)
+        else:
+            self.total_float += float(value)
+        self.count += 1
+
+    def mean(self) -> float:
+        if self.count == 0:
+            return 0.0
+        if self.total is not None:
+            total = float(self.total.item()) + self.total_float
+        else:
+            total = self.total_float
+        return total / float(self.count)
 
 
-def _mean_scalar(values: list[torch.Tensor] | list[float]) -> float:
+def _record(values: ScalarMeter | list[torch.Tensor], value: torch.Tensor | float | int) -> None:
+    if isinstance(values, ScalarMeter):
+        values.update(value)
+    else:
+        values.append(value.detach() if torch.is_tensor(value) else torch.tensor(float(value)))
+
+
+def _mean_scalar(values: ScalarMeter | list[torch.Tensor] | list[float]) -> float:
+    if isinstance(values, ScalarMeter):
+        return values.mean()
     if not values:
         return 0.0
     first = values[0]
@@ -246,6 +281,18 @@ def _cuda_memory_gb(device: torch.device) -> str:
     return f"alloc={allocated:.2f}GB reserved={reserved:.2f}GB"
 
 
+def _make_generator(device: torch.device, seed: int) -> torch.Generator | None:
+    try:
+        generator = torch.Generator(device=device)
+    except Exception:
+        try:
+            generator = torch.Generator()
+        except Exception:
+            return None
+    generator.manual_seed(int(seed))
+    return generator
+
+
 def train(args: argparse.Namespace) -> None:
     cfg = load_config(args.config)
     set_seed(int(cfg.get("seed", 42)))
@@ -281,6 +328,14 @@ def train(args: argparse.Namespace) -> None:
     save_optimizer_every = int(args.save_optimizer_every if args.save_optimizer_every is not None else get_nested(cfg, "training.save_optimizer_every", save_every))
     save_optimizer_best = _as_bool(get_nested(cfg, "training.save_optimizer_best", False))
     save_optimizer_last = _as_bool(get_nested(cfg, "training.save_optimizer_last", False))
+    validation_seed = int(get_nested(cfg, "training.validation_seed", 12345))
+    validation_mode = str(
+        args.validation_mode
+        if args.validation_mode is not None
+        else get_nested(cfg, "training.validation_mode", "main")
+    ).lower()
+    if validation_mode not in {"main", "full"}:
+        raise ValueError(f"Unsupported validation_mode={validation_mode!r}; expected 'main' or 'full'")
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
@@ -333,6 +388,8 @@ def train(args: argparse.Namespace) -> None:
             "save_every": save_every,
             "save_last_every": save_last_every,
             "save_optimizer_every": save_optimizer_every,
+            "validation_seed": validation_seed,
+            "validation_mode": validation_mode,
             "train_batches_per_epoch": len(train_loader),
             "valid_batches_per_epoch": len(valid_loader),
             "model_ablation": {
@@ -372,6 +429,7 @@ def train(args: argparse.Namespace) -> None:
         f"pin_memory={pin_memory} persistent_workers={persistent_workers} "
         f"prefetch_factor={prefetch_factor} "
         f"save_last_every={save_last_every} save_optimizer_every={save_optimizer_every} "
+        f"validation_mode={validation_mode} validation_seed={validation_seed} "
         f"train_gaf_cache={train_ds.gaf_cache is not None} "
         f"valid_gaf_cache={valid_ds.gaf_cache is not None}",
         flush=True,
@@ -385,29 +443,29 @@ def train(args: argparse.Namespace) -> None:
         diffusion.model.set_route_entropy_scale(route_entropy_scale)
         epoch_start = time.time()
         diffusion.train()
-        train_losses = []
-        train_loss_l1 = []
-        train_loss_l2 = []
-        train_loss_l3 = []
-        train_loss_l4 = []
-        train_ground_ot = []
-        train_ground_mask = []
-        train_ground_cycle = []
-        train_consistency_triad = []
-        train_consistency_cycle_rel = []
-        train_consistency_slot_div = []
-        train_slot_aux = []
-        train_ground_weighted = []
-        train_consistency_weighted = []
-        train_spectral_weight = []
-        train_route_entropy = []
-        train_route_max = []
-        train_text_drop = []
-        train_env_drop = []
-        train_semantic_drop = []
-        train_gaf_encoder_grad = []
-        train_grounding_grad = []
-        train_mmdit_grad = []
+        train_losses = ScalarMeter()
+        train_loss_l1 = ScalarMeter()
+        train_loss_l2 = ScalarMeter()
+        train_loss_l3 = ScalarMeter()
+        train_loss_l4 = ScalarMeter()
+        train_ground_ot = ScalarMeter()
+        train_ground_mask = ScalarMeter()
+        train_ground_cycle = ScalarMeter()
+        train_consistency_triad = ScalarMeter()
+        train_consistency_cycle_rel = ScalarMeter()
+        train_consistency_slot_div = ScalarMeter()
+        train_slot_aux = ScalarMeter()
+        train_ground_weighted = ScalarMeter()
+        train_consistency_weighted = ScalarMeter()
+        train_spectral_weight = ScalarMeter()
+        train_route_entropy = ScalarMeter()
+        train_route_max = ScalarMeter()
+        train_text_drop = ScalarMeter()
+        train_env_drop = ScalarMeter()
+        train_semantic_drop = ScalarMeter()
+        train_gaf_encoder_grad = ScalarMeter()
+        train_grounding_grad = ScalarMeter()
+        train_mmdit_grad = ScalarMeter()
         debug_shapes: dict[str, str] = {}
         print(
             f"epoch={epoch:04d} begin route_entropy_scale={route_entropy_scale:.4f} "
@@ -429,9 +487,9 @@ def train(args: argparse.Namespace) -> None:
             loss.backward()
             if grad_norm_every > 0 and step_idx % grad_norm_every == 0:
                 gaf_encoder, grounding, mmdit = _debug_modules(diffusion)
-                train_gaf_encoder_grad.append(_module_grad_norm(gaf_encoder))
-                train_grounding_grad.append(_module_grad_norm(grounding))
-                train_mmdit_grad.append(_module_grad_norm(mmdit))
+                _record(train_gaf_encoder_grad, _module_grad_norm(gaf_encoder))
+                _record(train_grounding_grad, _module_grad_norm(grounding))
+                _record(train_mmdit_grad, _module_grad_norm(mmdit))
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(diffusion.parameters(), grad_clip)
             optimizer.step()
@@ -481,28 +539,29 @@ def train(args: argparse.Namespace) -> None:
 
         print(f"epoch={epoch:04d} [DIAG] starting validation", flush=True)
         diffusion.eval()
-        val_losses = []
-        val_loss_l1 = []
-        val_loss_l2 = []
-        val_loss_l3 = []
-        val_loss_l4 = []
-        val_ground_ot = []
-        val_ground_mask = []
-        val_ground_cycle = []
-        val_consistency_triad = []
-        val_consistency_cycle_rel = []
-        val_consistency_slot_div = []
-        val_slot_aux = []
-        val_ground_weighted = []
-        val_consistency_weighted = []
-        val_spectral_weight = []
-        val_route_entropy = []
-        val_route_max = []
-        val_text_drop = []
-        val_env_drop = []
-        val_semantic_drop = []
+        val_losses = ScalarMeter()
+        val_loss_l1 = ScalarMeter()
+        val_loss_l2 = ScalarMeter()
+        val_loss_l3 = ScalarMeter()
+        val_loss_l4 = ScalarMeter()
+        val_ground_ot = ScalarMeter()
+        val_ground_mask = ScalarMeter()
+        val_ground_cycle = ScalarMeter()
+        val_consistency_triad = ScalarMeter()
+        val_consistency_cycle_rel = ScalarMeter()
+        val_consistency_slot_div = ScalarMeter()
+        val_slot_aux = ScalarMeter()
+        val_ground_weighted = ScalarMeter()
+        val_consistency_weighted = ScalarMeter()
+        val_spectral_weight = ScalarMeter()
+        val_route_entropy = ScalarMeter()
+        val_route_max = ScalarMeter()
+        val_text_drop = ScalarMeter()
+        val_env_drop = ScalarMeter()
+        val_semantic_drop = ScalarMeter()
         with torch.no_grad():
             print(f"epoch={epoch:04d} [DIAG] entering val_loader loop", flush=True)
+            val_generator = _make_generator(device, validation_seed)
             val_wait_start = time.perf_counter()
             for val_step_idx, batch in enumerate(valid_loader):
                 val_wait_seconds = time.perf_counter() - val_wait_start
@@ -511,7 +570,16 @@ def train(args: argparse.Namespace) -> None:
                 text_emb = batch["text_emb"].to(device, non_blocking=True)
                 gaf = batch["gaf"].to(device, non_blocking=True)
                 semantic_atoms = _optional_to_device(batch, "semantic_atoms", device)
-                loss, metrics = diffusion.training_loss(x, text_emb, gaf, semantic_atoms=semantic_atoms)
+                if validation_mode == "full":
+                    loss, metrics = diffusion.training_loss(x, text_emb, gaf, semantic_atoms=semantic_atoms)
+                else:
+                    loss, metrics = diffusion.validation_loss(
+                        x,
+                        text_emb,
+                        gaf,
+                        semantic_atoms=semantic_atoms,
+                        generator=val_generator,
+                    )
                 _record(val_losses, loss)
                 _record(val_loss_l1, metrics["loss_l1_flow"])
                 _record(val_loss_l2, metrics["loss_l2_ground"])
@@ -544,7 +612,7 @@ def train(args: argparse.Namespace) -> None:
                         flush=True,
                     )
                 val_wait_start = time.perf_counter()
-            print(f"epoch={epoch:04d} [DIAG] val loop done, {len(val_losses)} batches", flush=True)
+            print(f"epoch={epoch:04d} [DIAG] val loop done, {val_losses.count} batches", flush=True)
         train_loss = _mean_scalar(train_losses)
         val_loss = _mean_scalar(val_losses)
         row = {
@@ -820,6 +888,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-persistent-workers", dest="persistent_workers", action="store_false")
     parser.add_argument("--save-last-every", type=int, default=None)
     parser.add_argument("--save-optimizer-every", type=int, default=None)
+    parser.add_argument("--validation-mode", choices=["main", "full"], default=None)
     return parser
 
 
